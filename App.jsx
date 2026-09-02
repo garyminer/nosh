@@ -26,6 +26,7 @@ function parseRoute(h) {
   if ((m = p.match(/^\/l\/([^/]+)\/settings$/))) return { name: 'settings', listId: m[1] }
   if ((m = p.match(/^\/l\/([^/]+)$/))) return { name: 'list', listId: m[1] }
   if ((m = p.match(/^\/i\/([^/]+)$/))) return { name: 'item', itemId: m[1] }
+  if (p === '/import') return { name: 'import' }
   return { name: 'home' }
 }
 
@@ -161,6 +162,7 @@ export default function App() {
       {route.name === 'settings' && <ListSettings key={route.listId} listId={route.listId} session={session} />}
       {route.name === 'item' && <ItemScreen key={route.itemId} itemId={route.itemId} />}
       {route.name === 'join' && <JoinScreen code={route.code} />}
+      {route.name === 'import' && <ImportScreen />}
     </div>
   )
 }
@@ -357,7 +359,7 @@ function HomeScreen({ session }) {
             {lists.length === 0 && (
               <div className="empty">
                 <div className="big">No lists yet</div>
-                Create one below, or join someone else's with their 6-character code.
+                Create one below, join someone else's with their 6-character code, or import lists you already have.
               </div>
             )}
 
@@ -388,6 +390,10 @@ function HomeScreen({ session }) {
                 <Ico.plus /> New list
               </button>
             )}
+
+            <button className="btn block" style={{ marginTop: 8 }} onClick={() => navigate('/import')}>
+              Import lists &amp; items
+            </button>
 
             <form className="card" style={{ marginTop: 18 }} onSubmit={join}>
               <label className="field"><span>Join a shared list</span>
@@ -958,4 +964,326 @@ function JoinScreen({ code }) {
     </div>
   )
   return <div className="empty">Joining the list…</div>
+}
+
+/* ============================================================
+   Import — paste lists & items from elsewhere (e.g. OurGroceries)
+   ============================================================
+
+   Accepts either:
+
+   1) Plain text, one list per "# " heading, optional "## " category
+      sub-headings, one item per line. Quantity as "Milk x2" or
+      "Milk (2)"; a note after " -- " or " — ".
+
+        # Costco
+        ## Produce
+        Bananas x2
+        Spinach -- organic if they have it
+        ## Household
+        Paper towels
+
+        # Weekly groceries
+        Milk
+        Eggs (2 dozen)
+
+   2) JSON in the shape [{ "name": "Costco", "items": [
+        "Bananas", { "name": "Milk", "quantity": 2, "category":
+        "Dairy", "note": "2%", "crossed": false } ] }, ...]  — handy
+      if you (or I, when you paste me an export from another app)
+      convert the source data into this simple structure first.
+      "crossed": true marks an item as history only — it's remembered
+      for autocomplete in that list but not added as a to-buy item,
+      which is the right call for old crossed-off items imported in
+      bulk (you don't want last year's shopping cluttering today's
+      list). Any category name not already on the list gets created
+      automatically, so the original aisle/store layout carries over.
+   ------------------------------------------------------------ */
+
+function parseImportJson(text) {
+  let data
+  try { data = JSON.parse(text) } catch { return null }
+  const arr = Array.isArray(data) ? data : Array.isArray(data?.lists) ? data.lists : null
+  if (!arr) return null
+  return arr.map((l) => ({
+    name: String(l.name || l.title || 'Imported list').trim(),
+    items: (l.items || []).map((it) => {
+      if (typeof it === 'string') return { name: it.trim(), quantity: 1, category: null, note: null, crossed: false }
+      return {
+        name: String(it.name || it.value || '').trim(),
+        quantity: Math.max(1, parseInt(it.quantity, 10) || 1),
+        category: it.category ? String(it.category).trim() : null,
+        note: it.note ? String(it.note).trim() : null,
+        crossed: !!it.crossed,
+      }
+    }).filter((it) => it.name),
+  })).filter((l) => l.name && l.items.length)
+}
+
+function parseImportText(text) {
+  const lines = text.split(/\r?\n/)
+  const lists = []
+  let currentList = null
+  let currentCategory = null
+
+  for (const raw of lines) {
+    const line = raw.trim()
+    if (!line) continue
+
+    if (line.startsWith('## ')) { currentCategory = line.slice(3).trim(); continue }
+    if (line.startsWith('# ')) {
+      currentList = { name: line.slice(2).trim(), items: [] }
+      lists.push(currentList)
+      currentCategory = null
+      continue
+    }
+    if (!currentList) { currentList = { name: 'Imported list', items: [] }; lists.push(currentList) }
+
+    let item = line.replace(/^[-*•]\s*/, '')
+    let note = null
+    const noteSplit = item.split(/\s+(?:--|—)\s+/)
+    if (noteSplit.length > 1) { item = noteSplit[0]; note = noteSplit.slice(1).join(' - ').trim() }
+
+    let quantity = 1
+    let m = item.match(/^(.*?)\s*[x×]\s*(\d+)$/i)
+    if (m) { item = m[1]; quantity = parseInt(m[2], 10) }
+    else if ((m = item.match(/^(.*?)\s*\((\d+)\)$/))) { item = m[1]; quantity = parseInt(m[2], 10) }
+
+    item = item.trim()
+    if (!item) continue
+    currentList.items.push({ name: item, quantity: Math.max(1, quantity), category: currentCategory, note, crossed: false })
+  }
+  return lists.filter((l) => l.items.length)
+}
+
+function parseImport(text) {
+  return parseImportJson(text) || parseImportText(text)
+}
+
+// Run a list of async jobs with at most `limit` in flight at once,
+// so a big import (hundreds of items) doesn't fire everything at
+// the same instant, but still goes faster than one-at-a-time.
+async function runPooled(jobs, limit, onEach) {
+  let i = 0
+  async function worker() {
+    while (i < jobs.length) {
+      const idx = i++
+      await jobs[idx]()
+      onEach?.(idx)
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, jobs.length) }, worker))
+}
+
+function ImportScreen() {
+  const [raw, setRaw] = useState('')
+  const [fileName, setFileName] = useState('')
+  const [stage, setStage] = useState('paste') // 'paste' | 'done'
+  const [busy, setBusy] = useState(false)
+  const [progress, setProgress] = useState({ done: 0, total: 0 })
+  const [err, setErr] = useState('')
+  const [result, setResult] = useState(null)
+
+  const parsed = useMemo(() => (raw.trim() ? parseImport(raw) : []), [raw])
+  const totalItems = parsed.reduce((n, l) => n + l.items.length, 0)
+  const activeCount = parsed.reduce((n, l) => n + l.items.filter((it) => !it.crossed).length, 0)
+  const historyCount = totalItems - activeCount
+
+  function onFile(e) {
+    const file = e.target.files?.[0]
+    if (!file) return
+    setFileName(file.name)
+    const reader = new FileReader()
+    reader.onload = () => setRaw(String(reader.result || ''))
+    reader.readAsText(file)
+  }
+
+  async function ensureCategory(listId, cats, name) {
+    const hit = cats.find((c) => c.name.toLowerCase() === name.toLowerCase())
+    if (hit) return hit.id
+    const nextPos = (cats.length ? Math.max(...cats.map((c) => c.position)) : 0) + 10
+    const { data, error } = await supabase.from('categories')
+      .insert({ list_id: listId, name, position: nextPos }).select().single()
+    if (error) throw error
+    cats.push(data)
+    return data.id
+  }
+
+  async function runImport() {
+    setBusy(true); setErr('')
+    setProgress({ done: 0, total: totalItems })
+    try {
+      const { data: existing, error: e0 } = await supabase.from('lists').select('*')
+      if (e0) throw e0
+
+      const created = []
+      let doneSoFar = 0
+
+      for (const l of parsed) {
+        let list = existing.find((x) => x.name.trim().toLowerCase() === l.name.toLowerCase())
+        if (!list) {
+          const { data: nl, error } = await supabase.rpc('create_list', { p_name: l.name })
+          if (error) throw error
+          list = nl
+          existing.push(list)
+        }
+
+        const { data: catRows, error: ec } = await supabase.from('categories').select('*').eq('list_id', list.id)
+        if (ec) throw ec
+        const cats = catRows || []
+
+        // Create any missing categories one at a time, up front — avoids two
+        // items racing to create the same new category once we parallelize below.
+        const neededCatNames = [...new Set(l.items.map((it) => it.category).filter(Boolean))]
+        for (const name of neededCatNames) await ensureCategory(list.id, cats, name)
+
+        let added = 0, remembered = 0
+        const jobs = l.items.map((it) => async () => {
+          let categoryId = null
+          if (it.category) {
+            const hit = cats.find((c) => c.name.toLowerCase() === it.category.toLowerCase())
+            categoryId = hit ? hit.id : null
+          }
+          if (!categoryId) categoryId = guessCategoryId(it.name, cats)
+
+          if (it.crossed) {
+            const { error } = await supabase.rpc('remember_item', {
+              p_list_id: list.id, p_name: titleCase(it.name), p_category_id: categoryId, p_note: it.note || null,
+            })
+            if (error) throw error
+            remembered++
+          } else {
+            const { error } = await supabase.rpc('add_item', {
+              p_list_id: list.id, p_name: titleCase(it.name), p_quantity: it.quantity,
+              p_category_id: categoryId, p_note: it.note || null,
+            })
+            if (error) throw error
+            added++
+          }
+        })
+
+        await runPooled(jobs, 6, () => { doneSoFar++; setProgress({ done: doneSoFar, total: totalItems }) })
+        created.push({ id: list.id, name: list.name, added, remembered })
+      }
+      setResult(created)
+      setStage('done')
+    } catch (e) {
+      setErr(e.message || String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (stage === 'done') {
+    return (
+      <>
+        <div className="topbar">
+          <button className="btn icon" onClick={() => navigate('/')} aria-label="Back"><Ico.back /></button>
+          <h1>Import complete</h1>
+        </div>
+        <div className="wrap">
+          <div className="card">
+            <h3>Done</h3>
+            <p className="meta">Imported into {result.length} list{result.length === 1 ? '' : 's'}.</p>
+          </div>
+          <div className="rows" style={{ marginBottom: 16 }}>
+            {result.map((r) => (
+              <div className="row" key={r.id}>
+                <div className="body" onClick={() => navigate(`/l/${r.id}`)}>
+                  <div className="nm">{r.name}</div>
+                  <div className="nt">
+                    {r.added} to buy
+                    {r.remembered ? ` · ${r.remembered} remembered for autocomplete` : ''}
+                  </div>
+                </div>
+                <Ico.chev className="muted" />
+              </div>
+            ))}
+          </div>
+          <button className="btn primary block" onClick={() => navigate('/')}>Back to my lists</button>
+        </div>
+      </>
+    )
+  }
+
+  return (
+    <>
+      <div className="topbar">
+        <button className="btn icon" onClick={() => navigate('/')} aria-label="Back"><Ico.back /></button>
+        <h1>Import lists &amp; items</h1>
+      </div>
+
+      <div className="wrap">
+        {err && <div className="err">{err}</div>}
+
+        <div className="card small">
+          <p style={{ marginTop: 0 }}>
+            Paste plain text below. Start a list with a line like <code># Costco</code>{' '}
+            (just <code>#</code> then the name), optionally group items under{' '}
+            <code>## Category</code>, then one item per line. Add a quantity with{' '}
+            <code>x2</code> or <code>(2)</code>, and a note after <code>--</code>.
+          </p>
+          <p style={{ marginBottom: 0 }}>
+            Coming from OurGroceries: open a list on their website and use Print to get a
+            clean copy-pasteable version, or just retype the item names under a{' '}
+            <code># List name</code> heading — quickest for a handful of lists. For a full
+            export, hand me the file in chat and I'll convert it to a JSON file you can
+            upload below instead of pasting.
+          </p>
+        </div>
+
+        <label className="field">
+          <span>Upload a file (.json or .txt)</span>
+          <input className="input" type="file" accept=".json,.txt,application/json,text/plain" onChange={onFile} />
+        </label>
+        {fileName && <p className="small muted" style={{ marginTop: -6, marginBottom: 12 }}>Loaded {fileName}</p>}
+
+        <label className="field">
+          <span>…or paste here</span>
+          <textarea className="input" style={{ minHeight: 220, fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 14 }}
+                    value={raw} onChange={(e) => { setRaw(e.target.value); setFileName('') }}
+                    placeholder={'# Costco\n## Produce\nBananas x2\nSpinach -- organic if they have it\n\n# Weekly groceries\nMilk\nEggs (2 dozen)'} />
+        </label>
+
+        {raw.trim() && (
+          <div className="card">
+            <h3>Preview</h3>
+            {parsed.length === 0 ? (
+              <p className="meta">Couldn't find any items in that text yet.</p>
+            ) : (
+              <>
+                <p className="meta" style={{ marginBottom: 10 }}>
+                  {parsed.length} list{parsed.length === 1 ? '' : 's'}, {activeCount} item{activeCount === 1 ? '' : 's'} to buy
+                  {historyCount ? `, ${historyCount} more remembered for autocomplete only` : ''}.
+                  Lists matching one you already have will be added to, not duplicated.
+                </p>
+                <div className="stack">
+                  {parsed.map((l, i) => {
+                    const active = l.items.filter((it) => !it.crossed).length
+                    const history = l.items.length - active
+                    return (
+                      <div key={i} className="small">
+                        <strong>{l.name}</strong> — {active} to buy{history ? `, ${history} remembered` : ''}
+                        <div className="muted">{l.items.slice(0, 6).map((it) => it.name).join(', ')}{l.items.length > 6 ? ', …' : ''}</div>
+                      </div>
+                    )
+                  })}
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
+        {busy && progress.total > 0 && (
+          <p className="small muted center" style={{ marginBottom: 10 }}>
+            Importing… {progress.done} / {progress.total}
+          </p>
+        )}
+
+        <button className="btn primary block" disabled={busy || totalItems === 0} onClick={runImport}>
+          {busy ? 'Importing…' : `Import ${totalItems || ''} item${totalItems === 1 ? '' : 's'}`}
+        </button>
+      </div>
+    </>
+  )
 }
