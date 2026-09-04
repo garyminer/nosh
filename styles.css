@@ -212,6 +212,20 @@ textarea.input { min-height: 78px; resize: vertical; }
 .addbar .inner { max-width: 640px; margin: 0 auto; display: flex; gap: 8px; }
 .addbar .input { border-radius: 999px; }
 
+/* "Did you mean …?" — sits where the suggestions would, above the add bar. */
+.nearbar {
+  position: fixed; left: 0; right: 0; bottom: calc(64px + var(--safe-b)); z-index: 31;
+  background: var(--accent-soft); border-top: 1px solid var(--line);
+  padding: 10px 14px;
+}
+.nearbar .inner {
+  max-width: 640px; margin: 0 auto;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+}
+.nearbar .txt { flex: 1; min-width: 180px; font-size: 13px; color: var(--ink); }
+.nearbar .acts { display: flex; gap: 6px; flex: none; }
+.btn.small { padding: 7px 11px; font-size: 13px; }
+
 .suggest {
   position: fixed; left: 0; right: 0; bottom: calc(64px + var(--safe-b)); z-index: 29;
   max-height: 46vh; overflow-y: auto;

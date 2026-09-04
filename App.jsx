@@ -122,6 +122,91 @@ function matchesQuery(name, q) {
 
 const titleCase = (s) => s.replace(/\b[a-z]/g, (c) => c.toUpperCase())
 
+/* ---------------- telling one item from the same item typed twice ---------
+
+   Two levels, deliberately:
+
+   itemKey()     — case, accents, punctuation and plurals. "Bananas",
+                   "banana" and "BANANA" are unarguably the same thing, so
+                   these merge silently.
+
+   isNearMatch() — one word apart by a typo's worth of edits. This is a
+                   guess, so it only ever *offers* to merge. Silently folding
+                   "wheat bread" into "white bread" would quietly corrupt the
+                   list, and a wrong merge is far worse than a duplicate row.
+   ------------------------------------------------------------------------ */
+
+function normalizeName(s) {
+  return String(s || '')
+    .toLowerCase()
+    .normalize('NFKD').replace(/[\u0300-\u036f]/g, '')   // jalapeño -> jalapeno
+    .replace(/[^a-z0-9\s]/g, ' ')                        // half-and-half -> half and half
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+/* A crude English singulariser. It does not need to be *correct*, only
+   *consistent*: both spellings have to land on the same key. ("molasses"
+   reducing to "molass" is harmless — it only ever collides with itself.) */
+function singularWord(w) {
+  if (w.length < 4) return w
+  if (w.endsWith('ies') && w.length > 4) return w.slice(0, -3) + 'y'
+  for (const suf of ['ches', 'shes', 'sses', 'xes', 'zes', 'oes']) {
+    if (w.endsWith(suf) && w.length - 2 >= 3) return w.slice(0, -2)
+  }
+  if (w.endsWith('s') && !/(ss|us|is)$/.test(w) && w.length - 1 >= 3) return w.slice(0, -1)
+  return w
+}
+
+const itemKey = (name) =>
+  normalizeName(name).split(' ').filter(Boolean).map(singularWord).join(' ')
+
+// Damerau-Levenshtein: like edit distance, but a transposition ("yogrut")
+// costs 1 rather than 2, which is what most real typing mistakes look like.
+function editDistance(a, b) {
+  const la = a.length, lb = b.length
+  const d = Array.from({ length: la + 1 }, (_, i) => {
+    const row = new Array(lb + 1).fill(0)
+    row[0] = i
+    return row
+  })
+  for (let j = 0; j <= lb; j++) d[0][j] = j
+  for (let i = 1; i <= la; i++) {
+    for (let j = 1; j <= lb; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1
+      d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost)
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
+        d[i][j] = Math.min(d[i][j], d[i - 2][j - 2] + 1)
+      }
+    }
+  }
+  return d[la][lb]
+}
+
+/* Same number of words, exactly one of them different, and that word is long
+   enough that a typo is likelier than a real distinction. The length floor is
+   what keeps "beans"/"beers" and "green tea"/"green pea" apart. */
+function isNearMatch(a, b) {
+  const ka = itemKey(a), kb = itemKey(b)
+  if (!ka || !kb || ka === kb) return false
+
+  const wa = ka.split(' '), wb = kb.split(' ')
+  if (wa.length !== wb.length) return false
+
+  let diff = null
+  for (let i = 0; i < wa.length; i++) {
+    if (wa[i] === wb[i]) continue
+    if (diff) return false          // more than one word differs: different item
+    diff = [wa[i], wb[i]]
+  }
+  if (!diff) return false
+
+  const [x, y] = diff
+  const shortest = Math.min(x.length, y.length)
+  if (shortest < 5) return false
+  return editDistance(x, y) <= (shortest >= 8 ? 2 : 1)
+}
+
 /* ---------------- "who added this" helpers --------------- */
 
 // Turn a person row from list_people() into something displayable.
@@ -629,6 +714,7 @@ function ListScreen({ listId, session }) {
   const [loading, setLoading] = useState(true)
   const [draft, setDraft] = useState('')
   const [focused, setFocused] = useState(false)
+  const [nearby, setNearby] = useState(null)   // pending "did you mean …?" offer
   const inputRef = useRef(null)
   const knownPeopleRef = useRef([])
   useEffect(() => { knownPeopleRef.current = people.map((p) => p.user_id) }, [people])
@@ -747,13 +833,35 @@ function ListScreen({ listId, session }) {
   /* ---- suggestions ---- */
   const suggestions = useMemo(() => {
     const q = draft.trim()
-    if (!q) {
-      return master.slice(0, 12).filter((m) => !active.some((a) => a.name.toLowerCase() === m.name.toLowerCase()))
+
+    // One entry per distinct item, keeping whichever spelling you've used most.
+    // Without this, "Banana" and "Bananas" both sit in the list forever.
+    const byKey = new Map()
+    for (const m of master) {
+      const k = itemKey(m.name)
+      const cur = byKey.get(k)
+      if (!cur || (m.use_count || 0) > (cur.use_count || 0)) byKey.set(k, m)
     }
-    return master
-      .filter((m) => matchesQuery(m.name, q))
-      .filter((m) => m.name.toLowerCase() !== q.toLowerCase())
-      .slice(0, 12)
+    const uniq = [...byKey.values()]
+
+    if (!q) {
+      const onList = new Set(active.map((a) => itemKey(a.name)))
+      return uniq.filter((m) => !onList.has(itemKey(m.name))).slice(0, 12)
+    }
+
+    const qk = itemKey(q)
+    const hits = uniq.filter((m) => matchesQuery(m.name, q) && itemKey(m.name) !== qk)
+
+    // Nothing matched by prefix? You may have mistyped it — offer the closest
+    // thing you've bought before, so the typo never reaches the list.
+    if (hits.length < 5 && q.length >= 4) {
+      for (const m of uniq) {
+        if (hits.length >= 8) break
+        if (hits.includes(m)) continue
+        if (isNearMatch(q, m.name)) hits.push(m)
+      }
+    }
+    return hits.slice(0, 12)
   }, [draft, master, active])
 
   /* ---- actions ---- */
@@ -762,16 +870,18 @@ function ListScreen({ listId, session }) {
     const clean = name.trim()
     if (!clean) return
     setDraft('')
+    setNearby(null)
 
-    // Already on the list and not crossed off? Just bump the quantity.
-    const existing = active.find((a) => a.name.toLowerCase() === clean.toLowerCase())
+    // Same item by any spelling — case, punctuation or plural. Bump, don't duplicate.
+    const key = itemKey(clean)
+    const existing = active.find((a) => itemKey(a.name) === key)
     if (existing) return setQuantity(existing, existing.quantity + 1)
 
     // Crossed off already? Un-cross it instead of duplicating.
-    const crossed = done.find((a) => a.name.toLowerCase() === clean.toLowerCase())
+    const crossed = done.find((a) => itemKey(a.name) === key)
     if (crossed) return toggle(crossed)
 
-    const remembered = master.find((m) => m.name.toLowerCase() === clean.toLowerCase())
+    const remembered = master.find((m) => itemKey(m.name) === key)
     const catId = categoryId || remembered?.category_id || guessCategoryId(clean, cats)
 
     const optimistic = {
@@ -801,10 +911,71 @@ function ListScreen({ listId, session }) {
     // in the real one when it lands.
     if (res.data) setItems((prev) => prev.map((p) => (p.id === optimistic.id ? res.data : p)))
     setMaster((prev) => {
-      const hit = prev.find((m) => m.name.toLowerCase() === clean.toLowerCase())
+      const hit = prev.find((m) => itemKey(m.name) === key)
       if (hit) return prev.map((m) => (m === hit ? { ...m, use_count: m.use_count + 1 } : m))
       return [{ id: `m-${Date.now()}`, list_id: listId, name: titleCase(clean), category_id: catId, note: null, use_count: 1 }, ...prev]
     })
+
+    // Not the same key, but one typo away from something? Offer to fold them
+    // together. Only ever an offer — see the note above isNearMatch.
+    const addedId = res.data?.id || optimistic.id
+    const twinOnList = active.find((a) => isNearMatch(clean, a.name)) ||
+                       done.find((a) => isNearMatch(clean, a.name))
+    if (twinOnList) {
+      setNearby({ kind: 'merge', addedId, addedName: titleCase(clean), target: twinOnList })
+      return
+    }
+    const twinRemembered = master.find((m) => isNearMatch(clean, m.name))
+    if (twinRemembered) {
+      setNearby({ kind: 'rename', addedId, addedName: titleCase(clean), target: twinRemembered })
+    }
+  }
+
+  /* Accept the "did you mean" offer.
+     merge  — the twin is already on the list: add the quantities together and
+              drop the row we just made.
+     rename — the twin is only in your history: correct the spelling on the new
+              row and clear out the stray entry the typo created. */
+  async function acceptNearby() {
+    const n = nearby
+    setNearby(null)
+    if (!n) return
+
+    const added = items.find((i) => i.id === n.addedId)
+    if (!added) return
+
+    if (n.kind === 'merge') {
+      const target = items.find((i) => i.id === n.target.id)
+      if (!target) return
+      await setQuantity(target, (target.quantity || 1) + (added.quantity || 1))
+      if (target.crossed_off) await toggle(target)
+
+      setItems((prev) => prev.filter((p) => p.id !== added.id))
+      if (isTempId(added.id) && cancelQueuedAdd(added.id)) return
+      const res = await sendOrQueue(
+        { k: 'delete', ids: [added.id] },
+        () => supabase.from('items').delete().eq('id', added.id),
+      )
+      if (res.error) setErr(res.error.message)
+      return
+    }
+
+    const patch = { name: n.target.name, category_id: added.category_id || n.target.category_id || null }
+    setItems((prev) => prev.map((p) => (p.id === added.id ? { ...p, ...patch } : p)))
+    const res = await sendOrQueue(
+      { k: 'update', id: added.id, patch },
+      () => supabase.from('items').update(patch).eq('id', added.id),
+    )
+    if (res.error) return setErr(res.error.message)
+
+    // Best-effort tidy-up of the master-list entry the typo created. Skipped
+    // when offline — a stray autocomplete row is not worth queueing.
+    setMaster((prev) => prev.filter((m) => m.name !== n.addedName))
+    if (navigator.onLine !== false) {
+      try {
+        await supabase.from('master_items').delete().eq('list_id', listId).eq('name', n.addedName)
+      } catch { /* harmless if it fails */ }
+    }
   }
 
   async function toggle(item) {
@@ -914,7 +1085,26 @@ function ListScreen({ listId, session }) {
         )}
       </div>
 
-      {focused && suggestions.length > 0 && (
+      {nearby && (
+        <div className="nearbar">
+          <div className="inner">
+            <div className="txt">
+              Added <strong>{nearby.addedName}</strong>.{' '}
+              {nearby.kind === 'merge'
+                ? <>Did you mean the <strong>{nearby.target.name}</strong> already on the list?</>
+                : <>Did you mean <strong>{nearby.target.name}</strong>?</>}
+            </div>
+            <div className="acts">
+              <button className="btn ghost small" onClick={() => setNearby(null)}>Keep both</button>
+              <button className="btn primary small" onClick={acceptNearby}>
+                {nearby.kind === 'merge' ? 'Merge' : 'Fix it'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {focused && suggestions.length > 0 && !nearby && (
         <div className="suggest">
           <div className="inner">
             {suggestions.map((s) => (
