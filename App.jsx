@@ -211,10 +211,19 @@ export default function App() {
    Auth
    ============================================================ */
 
+/* Nosh has no confidential data in it, so there are no passwords: your email
+   address IS your identity. Supabase Auth still runs underneath (every RLS
+   policy in the database is built on auth.uid(), and realtime needs a real
+   session), so we hand it a password derived from the email address itself.
+
+   Be clear-eyed about what this means: this file ships to the browser, so the
+   derivation below is public. Anyone who knows a member's email address can
+   sign in as them and read or edit their lists. That is the deliberate trade
+   for never sending a confirmation email — see nosh-migration-02-passwordless.sql. */
+const derivePassword = (email) => `nosh:${email.trim().toLowerCase()}:v1`
+
 function AuthScreen({ pendingJoin }) {
-  const [mode, setMode] = useState('in')       // 'in' | 'up'
   const [email, setEmail] = useState('')
-  const [password, setPassword] = useState('')
   const [name, setName] = useState('')
   const [err, setErr] = useState('')
   const [note, setNote] = useState('')
@@ -223,33 +232,52 @@ function AuthScreen({ pendingJoin }) {
   async function submit(e) {
     e.preventDefault()
     setErr(''); setNote(''); setBusy(true)
+    const addr = email.trim().toLowerCase()
+    const secret = derivePassword(addr)
+    const typed = name.trim()
+
     try {
-      if (mode === 'in') {
-        const { error } = await supabase.auth.signInWithPassword({ email: email.trim(), password })
-        if (error) throw error
-      } else {
-        const { data, error } = await supabase.auth.signUp({
-          email: email.trim(),
-          password,
-          options: { data: { display_name: name.trim() || email.split('@')[0] } },
-        })
-        if (error) throw error
-        if (!data.session) setNote('Account created. Check your email to confirm, then sign in.')
+      // Returning? Sign in. Anything other than "wrong credentials" is a real
+      // failure (offline, rate limit) and shouldn't be retried as a signup.
+      const { data: inData, error: inErr } =
+        await supabase.auth.signInWithPassword({ email: addr, password: secret })
+
+      if (!inErr) {
+        if (typed) await saveDisplayName(inData.user.id, typed)
+        return
+      }
+      if (!/invalid login credentials/i.test(inErr.message || '')) throw inErr
+
+      // First time on this email — make the account.
+      const { data: upData, error: upErr } = await supabase.auth.signUp({
+        email: addr,
+        password: secret,
+        options: { data: { display_name: typed || addr.split('@')[0] } },
+      })
+
+      if (upErr) {
+        if (/already registered|already exists/i.test(upErr.message || '')) {
+          throw new Error(
+            'This email has an older account with a password on it. Run ' +
+            'nosh-migration-02-passwordless.sql in the Supabase SQL Editor to clear ' +
+            'the old passwords, then try again.'
+          )
+        }
+        throw upErr
+      }
+
+      if (!upData.session) {
+        setNote(
+          'Account created, but Supabase is still set to confirm email addresses. ' +
+          'Open Supabase → Authentication → Sign In / Providers → Email, turn OFF ' +
+          '"Confirm email", then press Continue again.'
+        )
       }
     } catch (e2) {
       setErr(e2.message || String(e2))
-    } finally { setBusy(false) }
-  }
-
-  async function magicLink() {
-    setErr(''); setNote('')
-    if (!email.trim()) return setErr('Enter your email first.')
-    const { error } = await supabase.auth.signInWithOtp({
-      email: email.trim(),
-      options: { emailRedirectTo: window.location.origin + (pendingJoin ? `/#/join/${pendingJoin}` : '/') },
-    })
-    if (error) setErr(error.message)
-    else setNote('Check your email for a sign-in link.')
+    } finally {
+      setBusy(false)
+    }
   }
 
   return (
@@ -261,41 +289,41 @@ function AuthScreen({ pendingJoin }) {
       {pendingJoin && (
         <div className="card small">
           You've been invited to a list (code <span className="code-chip">{pendingJoin}</span>).
-          Sign in or create an account to join it.
+          Enter your email below to join it.
         </div>
       )}
-
-      <div className="tabs">
-        <button className={mode === 'in' ? 'on' : ''} onClick={() => setMode('in')}>Sign in</button>
-        <button className={mode === 'up' ? 'on' : ''} onClick={() => setMode('up')}>Create account</button>
-      </div>
 
       {err && <div className="err">{err}</div>}
       {note && <p className="ok-note">{note}</p>}
 
       <form onSubmit={submit}>
-        {mode === 'up' && (
-          <label className="field"><span>Your name</span>
-            <input className="input" value={name} onChange={(e) => setName(e.target.value)} placeholder="Gary" autoComplete="name" />
-          </label>
-        )}
         <label className="field"><span>Email</span>
-          <input className="input" type="email" required value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" />
+          <input className="input" type="email" required autoFocus value={email}
+                 onChange={(e) => setEmail(e.target.value)} autoComplete="email"
+                 placeholder="you@example.com" />
         </label>
-        <label className="field"><span>Password</span>
-          <input className="input" type="password" required minLength={6} value={password}
-                 onChange={(e) => setPassword(e.target.value)} autoComplete={mode === 'in' ? 'current-password' : 'new-password'} />
+        <label className="field">
+          <span>Your name <span className="muted" style={{ fontWeight: 500 }}>— first time only</span></span>
+          <input className="input" value={name} onChange={(e) => setName(e.target.value)}
+                 placeholder="Gary" autoComplete="name" />
         </label>
-        <button className="btn primary block" disabled={busy}>
-          {busy ? 'Working…' : mode === 'in' ? 'Sign in' : 'Create account'}
+        <button className="btn primary block" disabled={busy || !email.trim()}>
+          {busy ? 'One moment…' : 'Continue'}
         </button>
       </form>
 
-      <p className="center small" style={{ marginTop: 18 }}>
-        <button className="btn ghost" onClick={magicLink}>Email me a sign-in link instead</button>
+      <p className="center small muted" style={{ marginTop: 18 }}>
+        No password. Your email is how the list knows who added what.
       </p>
     </div>
   )
+}
+
+// Keep profiles.display_name in step with whatever name the person last typed.
+async function saveDisplayName(userId, displayName) {
+  const { data } = await supabase.from('profiles').select('display_name').eq('id', userId).maybeSingle()
+  if (data && data.display_name === displayName) return
+  await supabase.from('profiles').update({ display_name: displayName }).eq('id', userId)
 }
 
 /* ============================================================
@@ -444,13 +472,47 @@ function HomeScreen({ session }) {
               <button className="btn block" disabled={busy || joinCode.length < 4}>Join list</button>
             </form>
 
-            <p className="center small muted" style={{ marginTop: 22 }}>
+            <YourName session={session} />
+
+            <p className="center small muted" style={{ marginTop: 14 }}>
               Signed in as {session.user.email}
             </p>
           </>
         )}
       </div>
     </>
+  )
+}
+
+/* Without a password screen to re-type your name on, this is the only place
+   to fix it — and it's the name everyone else sees on the items you add. */
+function YourName({ session }) {
+  const [name, setName] = useState('')
+  const [saved, setSaved] = useState('')
+
+  useEffect(() => {
+    supabase.from('profiles').select('display_name').eq('id', session.user.id).maybeSingle()
+      .then(({ data }) => setName(data?.display_name || ''))
+  }, [session.user.id])
+
+  async function save() {
+    const clean = name.trim()
+    if (!clean) return
+    await supabase.from('profiles').update({ display_name: clean }).eq('id', session.user.id)
+    setSaved('Saved'); setTimeout(() => setSaved(''), 1600)
+  }
+
+  return (
+    <div className="card" style={{ marginTop: 18 }}>
+      <label className="field" style={{ marginBottom: 0 }}>
+        <span>Your name {saved && <span className="ok-note" style={{ fontSize: 12 }}>· {saved}</span>}</span>
+        <input className="input" value={name} placeholder="Gary"
+               onChange={(e) => setName(e.target.value)} onBlur={save} />
+      </label>
+      <p className="meta" style={{ margin: '8px 0 0' }}>
+        Shown next to every item you add to a shared list.
+      </p>
+    </div>
   )
 }
 
