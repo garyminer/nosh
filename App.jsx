@@ -1,5 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { supabase } from './supabaseClient.js'
+import {
+  cacheGet, cacheSet, sendOrQueue, startOutboxSync, cancelQueuedAdd,
+  pendingCount, onOutboxChange, isTempId, findCachedItem,
+} from './offline.js'
 
 /* ============================================================
    Nosh — shared grocery lists
@@ -172,6 +176,50 @@ const whenText = (ts) => {
   return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
 }
 
+/* ---------------- offline plumbing --------------- */
+
+function useOnline() {
+  const [online, setOnline] = useState(navigator.onLine !== false)
+  useEffect(() => {
+    const up = () => setOnline(true)
+    const down = () => setOnline(false)
+    window.addEventListener('online', up)
+    window.addEventListener('offline', down)
+    return () => { window.removeEventListener('online', up); window.removeEventListener('offline', down) }
+  }, [])
+  return online
+}
+
+function usePending() {
+  const [n, setN] = useState(pendingCount())
+  useEffect(() => onOutboxChange(setN), [])
+  return n
+}
+
+/* One strip at the top of the screen covering both states, because they're
+   the same worry from the user's side: "is what I just tapped actually saved?" */
+function SyncBar() {
+  const online = useOnline()
+  const pending = usePending()
+  if (online && !pending) return null
+  const label = !online
+    ? (pending
+        ? `Offline · ${pending} change${pending === 1 ? '' : 's'} saved on this device`
+        : 'Offline · your list still works')
+    : `Syncing ${pending} change${pending === 1 ? '' : 's'}…`
+  return <div className={'syncbar' + (online ? ' syncing' : '')}>{label}</div>
+}
+
+// A network failure while reading isn't worth an error message — the cached
+// copy is already on screen and the sync bar explains itself.
+function isOfflineError(err) {
+  if (!err) return false
+  if (navigator.onLine === false) return true
+  const m = String(err.message || err).toLowerCase()
+  return m.includes('failed to fetch') || m.includes('load failed') ||
+         m.includes('networkerror') || m.includes('network request failed')
+}
+
 function useCopy() {
   const [copied, setCopied] = useState('')
   const copy = async (text, key = 'x') => {
@@ -206,11 +254,22 @@ export default function App() {
     return () => sub.subscription.unsubscribe()
   }, [])
 
+  // Drain anything queued while offline, now and whenever the network or the
+  // tab comes back. Only once we're signed in — the writes need a session.
+  useEffect(() => {
+    if (!session) return
+    return startOutboxSync(() => {
+      // Nudge the open screen to re-read once the queue has landed.
+      window.dispatchEvent(new Event('nosh:synced'))
+    })
+  }, [session])
+
   if (booting) return <div className="empty">Loading…</div>
   if (!session) return <AuthScreen pendingJoin={route.name === 'join' ? route.code : null} />
 
   return (
     <div className="app">
+      <SyncBar />
       {route.name === 'home' && <HomeScreen session={session} />}
       {route.name === 'list' && <ListScreen key={route.listId} listId={route.listId} session={session} />}
       {route.name === 'settings' && <ListSettings key={route.listId} listId={route.listId} session={session} />}
@@ -356,22 +415,48 @@ function HomeScreen({ session }) {
   const [joinCode, setJoinCode] = useState('')
   const [busy, setBusy] = useState(false)
 
-  const load = useCallback(async () => {
-    setErr('')
-    const [{ data: ls, error: e1 }, { data: its, error: e2 }] = await Promise.all([
-      supabase.from('lists').select('*').order('created_at', { ascending: true }),
-      supabase.from('items').select('id,name,list_id,crossed_off,quantity'),
-    ])
-    if (e1 || e2) setErr((e1 || e2).message)
+  const applyLists = useCallback((ls, its) => {
     setLists(ls || [])
     setAllItems(its || [])
     const c = {}
     for (const i of its || []) if (!i.crossed_off) c[i.list_id] = (c[i.list_id] || 0) + 1
     setCounts(c)
-    setLoading(false)
   }, [])
 
+  // Cached copy first, so the home screen isn't a spinner when you're offline.
+  useEffect(() => {
+    const cached = cacheGet('home')
+    if (cached) { applyLists(cached.lists, cached.items); setLoading(false) }
+  }, [applyLists])
+
+  const load = useCallback(async () => {
+    setErr('')
+    try {
+      const [{ data: ls, error: e1 }, { data: its, error: e2 }] = await Promise.all([
+        supabase.from('lists').select('*').order('created_at', { ascending: true }),
+        supabase.from('items').select('id,name,list_id,crossed_off,quantity'),
+      ])
+      const e = e1 || e2
+      if (e) {
+        if (!isOfflineError(e)) setErr(e.message)
+        return
+      }
+      applyLists(ls, its)
+      cacheSet('home', { lists: ls || [], items: its || [], savedAt: Date.now() })
+    } catch (e) {
+      if (!isOfflineError(e)) setErr(e.message || String(e))
+    } finally {
+      setLoading(false)
+    }
+  }, [applyLists])
+
   useEffect(() => { load() }, [load])
+
+  useEffect(() => {
+    const on = () => load()
+    window.addEventListener('nosh:synced', on)
+    return () => window.removeEventListener('nosh:synced', on)
+  }, [load])
 
   async function createList(e) {
     e.preventDefault()
@@ -548,22 +633,50 @@ function ListScreen({ listId, session }) {
   const knownPeopleRef = useRef([])
   useEffect(() => { knownPeopleRef.current = people.map((p) => p.user_id) }, [people])
 
+  // Show the last-known copy instantly (and it's all we get when offline),
+  // then refresh from the network behind it.
+  useEffect(() => {
+    const cached = cacheGet(`list:${listId}`)
+    if (cached) {
+      setList(cached.list); setCats(cached.cats || []); setItems(cached.items || [])
+      setMaster(cached.master || []); setPeople(cached.people || [])
+      setLoading(false)
+    }
+  }, [listId])
+
   const load = useCallback(async () => {
-    const [l, c, i, m, p] = await Promise.all([
-      supabase.from('lists').select('*').eq('id', listId).maybeSingle(),
-      supabase.from('categories').select('*').eq('list_id', listId).order('position'),
-      supabase.from('items').select('*').eq('list_id', listId),
-      supabase.from('master_items').select('*').eq('list_id', listId).order('use_count', { ascending: false }).limit(500),
-      supabase.rpc('list_people', { p_list_id: listId }),
-    ])
-    const e = l.error || c.error || i.error || m.error || p.error
-    if (e) setErr(e.message)
-    setList(l.data); setCats(c.data || []); setItems(i.data || []); setMaster(m.data || [])
-    setPeople(p.data || [])
-    setLoading(false)
+    try {
+      const [l, c, i, m, p] = await Promise.all([
+        supabase.from('lists').select('*').eq('id', listId).maybeSingle(),
+        supabase.from('categories').select('*').eq('list_id', listId).order('position'),
+        supabase.from('items').select('*').eq('list_id', listId),
+        supabase.from('master_items').select('*').eq('list_id', listId).order('use_count', { ascending: false }).limit(500),
+        supabase.rpc('list_people', { p_list_id: listId }),
+      ])
+      const e = l.error || c.error || i.error || m.error || p.error
+      if (e) {
+        // Offline just means "keep showing the cache"; anything else is real.
+        if (!isOfflineError(e)) setErr(e.message)
+        setLoading(false)
+        return
+      }
+      setList(l.data); setCats(c.data || []); setItems(i.data || []); setMaster(m.data || [])
+      setPeople(p.data || [])
+    } catch (e) {
+      if (!isOfflineError(e)) setErr(e.message || String(e))
+    } finally {
+      setLoading(false)
+    }
   }, [listId])
 
   useEffect(() => { load() }, [load])
+
+  // Re-read once queued changes have been accepted by the server.
+  useEffect(() => {
+    const on = () => load()
+    window.addEventListener('nosh:synced', on)
+    return () => window.removeEventListener('nosh:synced', on)
+  }, [load])
 
   // live sync: anyone else's changes show up here
   useEffect(() => {
@@ -585,6 +698,15 @@ function ListScreen({ listId, session }) {
       .subscribe()
     return () => { supabase.removeChannel(ch) }
   }, [listId])
+
+  // Keep the offline copy current after every change. master_items is trimmed
+  // because it's the only unbounded piece and localStorage is not.
+  useEffect(() => {
+    if (loading || !list) return
+    cacheSet(`list:${listId}`, {
+      list, cats, items, people, master: master.slice(0, 200), savedAt: Date.now(),
+    })
+  }, [listId, loading, list, cats, items, master, people])
 
   const catById = useMemo(() => Object.fromEntries(cats.map((c) => [c.id, c])), [cats])
 
@@ -660,15 +782,24 @@ function ListScreen({ listId, session }) {
     }
     setItems((prev) => [...prev, optimistic])
 
-    const { data, error } = await supabase.rpc('add_item', {
+    const args = {
       p_list_id: listId, p_name: titleCase(clean), p_quantity: 1,
       p_category_id: catId, p_note: note || remembered?.note || null,
-    })
-    if (error) {
-      setItems((prev) => prev.filter((p) => p.id !== optimistic.id))
-      return setErr(error.message)
     }
-    setItems((prev) => prev.map((p) => (p.id === optimistic.id ? data : p)))
+    const res = await sendOrQueue(
+      {
+        k: 'add', tempId: optimistic.id, listId,
+        name: args.p_name, quantity: 1, categoryId: catId, note: args.p_note,
+      },
+      () => supabase.rpc('add_item', args),
+    )
+    if (res.error) {
+      setItems((prev) => prev.filter((p) => p.id !== optimistic.id))
+      return setErr(res.error.message)
+    }
+    // Queued? Keep the optimistic row and its temporary id — the outbox swaps
+    // in the real one when it lands.
+    if (res.data) setItems((prev) => prev.map((p) => (p.id === optimistic.id ? res.data : p)))
     setMaster((prev) => {
       const hit = prev.find((m) => m.name.toLowerCase() === clean.toLowerCase())
       if (hit) return prev.map((m) => (m === hit ? { ...m, use_count: m.use_count + 1 } : m))
@@ -686,17 +817,22 @@ function ListScreen({ listId, session }) {
     setItems((prev) => prev.map((p) => (
       p.id === item.id ? { ...p, crossed_off: next, crossed_at: next ? now : null, ...reAdd } : p
     )))
-    const { error } = await supabase.from('items')
-      .update({ crossed_off: next, crossed_at: next ? now : null })
-      .eq('id', item.id)
-    if (error) { setErr(error.message); load() }
+    const patch = { crossed_off: next, crossed_at: next ? now : null }
+    const res = await sendOrQueue(
+      { k: 'update', id: item.id, patch },
+      () => supabase.from('items').update(patch).eq('id', item.id),
+    )
+    if (res.error) { setErr(res.error.message); load() }
   }
 
   async function setQuantity(item, q) {
     const n = Math.max(1, q)
     setItems((prev) => prev.map((p) => (p.id === item.id ? { ...p, quantity: n } : p)))
-    const { error } = await supabase.from('items').update({ quantity: n }).eq('id', item.id)
-    if (error) { setErr(error.message); load() }
+    const res = await sendOrQueue(
+      { k: 'update', id: item.id, patch: { quantity: n } },
+      () => supabase.from('items').update({ quantity: n }).eq('id', item.id),
+    )
+    if (res.error) { setErr(res.error.message); load() }
   }
 
   async function clearCrossed() {
@@ -704,8 +840,17 @@ function ListScreen({ listId, session }) {
     if (!confirm(`Remove ${done.length} crossed-off item${done.length === 1 ? '' : 's'} from this list?`)) return
     const ids = done.map((d) => d.id)
     setItems((prev) => prev.filter((p) => !ids.includes(p.id)))
-    const { error } = await supabase.from('items').delete().in('id', ids)
-    if (error) { setErr(error.message); load() }
+
+    // Anything still waiting to be created is cancelled outright rather than
+    // created-then-deleted.
+    const realIds = ids.filter((id) => !(isTempId(id) && cancelQueuedAdd(id)))
+    if (!realIds.length) return
+
+    const res = await sendOrQueue(
+      { k: 'delete', ids: realIds },
+      () => supabase.from('items').delete().in('id', realIds),
+    )
+    if (res.error) { setErr(res.error.message); load() }
   }
 
   if (loading) return <div className="empty">Loading…</div>
@@ -834,45 +979,69 @@ function ItemScreen({ itemId, session }) {
 
   useEffect(() => {
     (async () => {
-      const { data, error } = await supabase.from('items')
-        .select('*, lists(id,name)').eq('id', itemId).maybeSingle()
-      if (error) setErr(error.message)
-      setItem(data)
-      if (data) {
-        const [c, p] = await Promise.all([
-          supabase.from('categories').select('*').eq('list_id', data.list_id).order('position'),
-          supabase.rpc('list_people', { p_list_id: data.list_id }),
-        ])
-        setCats(c.data || [])
-        setPeople(p.data || [])
+      // An item added while offline exists only on this device, so don't even
+      // ask the server for it.
+      const cached = findCachedItem(itemId)
+      if (cached) { setItem(cached); setCats(cached._cats || []); setLoading(false) }
+      if (isTempId(itemId)) { setLoading(false); return }
+
+      try {
+        const { data, error } = await supabase.from('items')
+          .select('*, lists(id,name)').eq('id', itemId).maybeSingle()
+        if (error) {
+          if (!isOfflineError(error) && !cached) setErr(error.message)
+        } else if (data) {
+          setItem(data)
+          const [c, p] = await Promise.all([
+            supabase.from('categories').select('*').eq('list_id', data.list_id).order('position'),
+            supabase.rpc('list_people', { p_list_id: data.list_id }),
+          ])
+          setCats(c.data || [])
+          setPeople(p.data || [])
+        }
+      } catch (e) {
+        if (!isOfflineError(e) && !cached) setErr(e.message || String(e))
+      } finally {
+        setLoading(false)
       }
-      setLoading(false)
     })()
   }, [itemId])
 
   async function save() {
     setSaving(true); setErr('')
-    const { error } = await supabase.from('items').update({
+    const patch = {
       name: item.name.trim(),
       quantity: Math.max(1, item.quantity),
       note: item.note?.trim() || null,
       category_id: item.category_id || null,
-    }).eq('id', item.id)
-    if (!error) {
-      await supabase.rpc('remember_item', {
-        p_list_id: item.list_id, p_name: item.name.trim(),
-        p_category_id: item.category_id || null, p_note: item.note?.trim() || null,
-      })
+    }
+    const res = await sendOrQueue(
+      { k: 'update', id: item.id, patch },
+      () => supabase.from('items').update(patch).eq('id', item.id),
+    )
+    if (!res.error && !res.queued) {
+      // Only worth remembering once the edit itself is on the server; if it's
+      // queued, the master list catches up on the next add of the same name.
+      try {
+        await supabase.rpc('remember_item', {
+          p_list_id: item.list_id, p_name: patch.name,
+          p_category_id: patch.category_id, p_note: patch.note,
+        })
+      } catch { /* the item itself saved; the autocomplete hint can wait */ }
     }
     setSaving(false)
-    if (error) return setErr(error.message)
+    if (res.error) return setErr(res.error.message)
     navigate(`/l/${item.list_id}`)
   }
 
   async function remove() {
     if (!confirm(`Delete "${item.name}"?`)) return
-    const { error } = await supabase.from('items').delete().eq('id', item.id)
-    if (error) return setErr(error.message)
+    if (isTempId(item.id) && cancelQueuedAdd(item.id)) return navigate(`/l/${item.list_id}`)
+    const res = await sendOrQueue(
+      { k: 'delete', ids: [item.id] },
+      () => supabase.from('items').delete().eq('id', item.id),
+    )
+    if (res.error) return setErr(res.error.message)
     navigate(`/l/${item.list_id}`)
   }
 

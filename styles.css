@@ -132,6 +132,18 @@ textarea.input { min-height: 78px; resize: vertical; }
   display: grid; place-items: center; font-weight: 750; font-size: 14px;
 }
 
+/* ---------- offline / sync bar ---------- */
+.syncbar {
+  position: sticky; top: 0; z-index: 40;
+  padding: 7px 14px;
+  font-size: 13px; font-weight: 600; text-align: center;
+  background: #4A3608; color: #FFD98A;
+}
+.syncbar.syncing { background: var(--accent-soft); color: var(--accent-text); }
+@media (prefers-color-scheme: light) {
+  .syncbar { background: #FFF4D6; color: #7A5300; }
+}
+
 /* ---------- item rows ---------- */
 .section-head {
   display: flex; align-items: center; gap: 8px;
