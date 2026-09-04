@@ -131,15 +131,29 @@ function initialOf(label) {
   return (c || '?').toUpperCase()
 }
 
+/* Hand-picked dot colours, for when the hash below lands somewhere you don't
+   want. Keyed by display name (lowercased, any "(you)" stripped); the full name
+   is tried first, then the first word, so "Annette" and "Annette M" both match.
+   Values are HSL hues, 0-359: 0 red · 30 orange · 50 yellow · 140 green
+   · 190 teal · 215 blue · 275 purple · 330 pink. */
+const HUE_OVERRIDES = new Map([
+  ['annette', 215],   // blue — the id hash had put her in the purples
+])
+
 // Stable per-person colour so the same person is the same colour everywhere.
-function avatarHue(id) {
+function avatarHue(id, label) {
+  const key = String(label || '').toLowerCase().replace(/\(you\)\s*$/, '').trim()
+  if (HUE_OVERRIDES.has(key)) return HUE_OVERRIDES.get(key)
+  const first = key.split(/\s+/)[0]
+  if (HUE_OVERRIDES.has(first)) return HUE_OVERRIDES.get(first)
+
   let h = 0
   for (const ch of String(id || '')) h = (h * 31 + ch.charCodeAt(0)) % 360
   return h
 }
 
 function Avatar({ id, label, size = 24 }) {
-  const hue = avatarHue(id)
+  const hue = avatarHue(id, label)
   return (
     <span className="who" title={`Added by ${label}`} aria-label={`Added by ${label}`}
           style={{ width: size, height: size, fontSize: Math.round(size * 0.46), '--h': String(hue) }}>
