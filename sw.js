@@ -15,7 +15,16 @@
    store.
    ============================================================ */
 
-const VERSION = 'nosh-v1'
+/* Stamped with the build id by vite.config.js at copy time.
+
+   This is load-bearing, not cosmetic. A cache name that never changes means a
+   new deploy inherits the previous build's cached index.html, which points at
+   hashed asset files (index-A1b2.js) that no longer exist on the server. If
+   the browser has since evicted those assets, they 404 and the page renders
+   blank. A per-build name means every deploy ships a byte-different sw.js,
+   which the browser treats as an update: it installs, activates, and deletes
+   every older cache. */
+const VERSION = '__BUILD__'
 const SHELL = 'nosh-shell-' + VERSION
 
 self.addEventListener('install', (event) => {
@@ -53,8 +62,12 @@ self.addEventListener('fetch', (event) => {
       (async () => {
         try {
           const fresh = await fetch(req)
-          const cache = await caches.open(SHELL)
-          cache.put('/index.html', fresh.clone())
+          // Only keep a shell that actually loaded. Caching a 404 or an error
+          // page here would serve a blank app until the next good fetch.
+          if (fresh && fresh.ok) {
+            const cache = await caches.open(SHELL)
+            cache.put('/index.html', fresh.clone())
+          }
           return fresh
         } catch {
           const cache = await caches.open(SHELL)
@@ -89,6 +102,14 @@ self.addEventListener('fetch', (event) => {
 
       if (hit) return hit
       const res = await network
+
+      /* A 404 on a hashed bundle means this page came from a stale shell that
+         outlived its build. Serving the 404 leaves a blank screen, so drop the
+         stale shell and let the next load fetch a fresh one. */
+      if (res && res.status === 404 && /\/assets\//.test(url.pathname)) {
+        await cache.delete('/index.html')
+      }
+
       if (res) return res
       return new Response('', { status: 504, statusText: 'Offline' })
     })()

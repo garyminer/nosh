@@ -1,6 +1,6 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
-import { copyFileSync, existsSync, mkdirSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -33,13 +33,28 @@ function copyRootStatic() {
     closeBundle() {
       const dest = resolve(HERE, outDir)
       mkdirSync(dest, { recursive: true })
+
+      // Every build gets its own cache name. Without this the service worker
+      // file is byte-identical between deploys, the browser never treats it as
+      // an update, and a new build inherits the previous one's cached
+      // index.html — which points at asset filenames that no longer exist.
+      const build = Date.now().toString(36)
+
       for (const file of ROOT_STATIC) {
         const from = resolve(HERE, file)
         if (!existsSync(from)) {
           this.warn(`nosh: skipping missing static file "${file}"`)
           continue
         }
-        copyFileSync(from, resolve(dest, file))
+        if (file === 'sw.js') {
+          const src = readFileSync(from, 'utf8')
+          if (!src.includes('__BUILD__')) {
+            this.warn('nosh: sw.js has no __BUILD__ placeholder; caches will not version per build')
+          }
+          writeFileSync(resolve(dest, file), src.replaceAll('__BUILD__', build))
+        } else {
+          copyFileSync(from, resolve(dest, file))
+        }
       }
     },
   }
