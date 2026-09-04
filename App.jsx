@@ -148,6 +148,7 @@ const UNITS = [
   { u: 'L',      alias: ['l', 'liter', 'liters', 'litre', 'litres'] },
   { u: 'mL',     alias: ['ml', 'milliliter', 'milliliters'] },
   { u: 'dozen',  alias: ['dozen', 'dozens', 'doz'] },
+  { u: 'case',   alias: ['case', 'cases'] },
   { u: 'bunch',  alias: ['bunch', 'bunches'] },
   { u: 'head',   alias: ['head', 'heads'] },
   { u: 'clove',  alias: ['clove', 'cloves'] },
