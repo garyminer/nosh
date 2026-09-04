@@ -978,6 +978,7 @@ function ListScreen({ listId, session }) {
   const [present, setPresent] = useState([])
   const [shopping, setShopping] = useState(false)
   const [showRegulars, setShowRegulars] = useState(false)
+  const [recipes, setRecipes] = useState([])
   const inputRef = useRef(null)
   const chanRef = useRef(null)
   const subscribedRef = useRef(false)
@@ -996,18 +997,21 @@ function ListScreen({ listId, session }) {
     if (cached) {
       setList(cached.list); setCats(cached.cats || []); setItems(cached.items || [])
       setMaster(cached.master || []); setPeople(cached.people || [])
+      setRecipes(cached.recipes || [])
       setLoading(false)
     }
   }, [listId])
 
   const load = useCallback(async () => {
     try {
-      const [l, c, i, m, p] = await Promise.all([
+      const [l, c, i, m, p, r] = await Promise.all([
         supabase.from('lists').select('*').eq('id', listId).maybeSingle(),
         supabase.from('categories').select('*').eq('list_id', listId).order('position'),
         supabase.from('items').select('*').eq('list_id', listId),
         supabase.from('master_items').select('*').eq('list_id', listId).order('use_count', { ascending: false }).limit(500),
         supabase.rpc('list_people', { p_list_id: listId }),
+        // Ingredients come back nested, so recipes cost one query, not two.
+        supabase.from('recipes').select('*, recipe_items(*)').eq('list_id', listId).order('name'),
       ])
       const e = l.error || c.error || i.error || m.error || p.error
       if (e) {
@@ -1018,6 +1022,9 @@ function ListScreen({ listId, session }) {
       }
       setList(l.data); setCats(c.data || []); setItems(i.data || []); setMaster(m.data || [])
       setPeople(p.data || [])
+      // Tolerated separately: if migration 04 hasn't run yet, the rest of the
+      // list should still load rather than the screen going blank.
+      if (!r.error) setRecipes(r.data || [])
     } catch (e) {
       if (!isOfflineError(e)) setErr(e.message || String(e))
     } finally {
@@ -1077,9 +1084,9 @@ function ListScreen({ listId, session }) {
   useEffect(() => {
     if (loading || !list) return
     cacheSet(`list:${listId}`, {
-      list, cats, items, people, master: master.slice(0, 200), savedAt: Date.now(),
+      list, cats, items, people, recipes, master: master.slice(0, 200), savedAt: Date.now(),
     })
-  }, [listId, loading, list, cats, items, master, people])
+  }, [listId, loading, list, cats, items, master, people, recipes])
 
   const catById = useMemo(() => Object.fromEntries(cats.map((c) => [c.id, c])), [cats])
 
@@ -1293,13 +1300,101 @@ function ListScreen({ listId, session }) {
     }
   }
 
-  /* Bulk add from the regulars sheet. Sequential on purpose: the outbox
-     replays in order, so the list ends up in the order you ticked. */
+  /* Bulk add from the regulars sheet or a recipe. Sequential on purpose: the
+     outbox replays in order, so the list ends up in the order you ticked.
+
+     Going through addItem rather than a server-side bulk RPC is what makes a
+     recipe behave sensibly on top of a list you've already started — onions
+     you already have get their quantity bumped instead of duplicated — and it
+     works offline for free. */
   async function addMany(picks) {
     setShowRegulars(false)
     for (const m of picks) {
-      await addItem(m.name, { categoryId: m.category_id, note: m.note, unit: m.unit })
+      await addItem(m.name, {
+        categoryId: m.category_id, note: m.note, unit: m.unit,
+        quantity: m.quantity == null ? 1 : qtyNum(m.quantity),
+      })
     }
+  }
+
+  /* Recipes are edited at home, not in the aisle: these need a connection.
+     Adding a recipe TO the list goes through addMany above, so that part
+     works offline like everything else. */
+  const needsNetwork = () => {
+    if (navigator.onLine === false) {
+      setErr('Editing recipes needs a connection. Adding one to your list works offline.')
+      return true
+    }
+    return false
+  }
+
+  async function createRecipe(name, sourceItems) {
+    if (needsNetwork()) return null
+    const { data: recipe, error } = await supabase.from('recipes')
+      .insert({ list_id: listId, name: name.trim() }).select().single()
+    if (error) { setErr(error.message); return null }
+
+    let rows = []
+    if (sourceItems.length) {
+      const payload = sourceItems.map((it, n) => ({
+        recipe_id: recipe.id, name: it.name, quantity: qtyNum(it.quantity),
+        unit: it.unit || null, note: it.note || null,
+        category_id: it.category_id || null, position: n * 10,
+      }))
+      const { data, error: e2 } = await supabase.from('recipe_items').insert(payload).select()
+      if (e2) { setErr(e2.message); return null }
+      rows = data || []
+    }
+    const full = { ...recipe, recipe_items: rows }
+    setRecipes((prev) => [...prev, full].sort((a, b) => a.name.localeCompare(b.name)))
+    return full
+  }
+
+  async function deleteRecipe(recipe) {
+    if (needsNetwork()) return
+    if (!confirm(`Delete the "${recipe.name}" recipe? Items already on your list stay put.`)) return
+    setRecipes((prev) => prev.filter((r) => r.id !== recipe.id))
+    const { error } = await supabase.from('recipes').delete().eq('id', recipe.id)
+    if (error) { setErr(error.message); load() }
+  }
+
+  async function renameRecipe(recipe, name) {
+    if (needsNetwork()) return
+    const clean = name.trim()
+    if (!clean || clean === recipe.name) return
+    setRecipes((prev) => prev.map((r) => (r.id === recipe.id ? { ...r, name: clean } : r))
+      .sort((a, b) => a.name.localeCompare(b.name)))
+    const { error } = await supabase.from('recipes').update({ name: clean }).eq('id', recipe.id)
+    if (error) { setErr(error.message); load() }
+  }
+
+  async function addRecipeItem(recipe, text) {
+    if (needsNetwork()) return
+    const p = parseQuantityUnit(text)
+    if (!p.name) return
+    const remembered = master.find((m) => itemKey(m.name) === itemKey(p.name))
+    const row = {
+      recipe_id: recipe.id, name: titleCase(p.name), quantity: p.quantity,
+      unit: p.unit || remembered?.unit || null, note: remembered?.note || null,
+      category_id: remembered?.category_id || guessCategoryId(p.name, cats),
+      position: (recipe.recipe_items?.length || 0) * 10 + 10,
+    }
+    const { data, error } = await supabase.from('recipe_items').insert(row).select().single()
+    if (error) { setErr(error.message); return }
+    setRecipes((prev) => prev.map((r) => (
+      r.id === recipe.id ? { ...r, recipe_items: [...(r.recipe_items || []), data] } : r
+    )))
+  }
+
+  async function removeRecipeItem(recipe, ing) {
+    if (needsNetwork()) return
+    setRecipes((prev) => prev.map((r) => (
+      r.id === recipe.id
+        ? { ...r, recipe_items: (r.recipe_items || []).filter((x) => x.id !== ing.id) }
+        : r
+    )))
+    const { error } = await supabase.from('recipe_items').delete().eq('id', ing.id)
+    if (error) { setErr(error.message); load() }
   }
 
   async function toggle(item) {
@@ -1490,8 +1585,12 @@ function ListScreen({ listId, session }) {
       </div>
 
       {showRegulars && (
-        <RegularsSheet master={master} items={items}
-                       onAdd={addMany} onClose={() => setShowRegulars(false)} />
+        <RegularsSheet master={master} items={items} recipes={recipes}
+                       onAdd={addMany} onClose={() => setShowRegulars(false)}
+                       recipeActions={{
+                         create: createRecipe, remove: deleteRecipe, rename: renameRecipe,
+                         addItem: addRecipeItem, removeItem: removeRecipeItem,
+                       }} />
       )}
     </>
   )
@@ -1534,13 +1633,25 @@ export const activeItemKeys = (items) => {
   return s
 }
 
-function RegularsSheet({ master, items, onAdd, onClose }) {
+function RegularsSheet({ master, items, recipes, onAdd, onClose, recipeActions }) {
+  const [tab, setTab] = useState('regulars')
   const [picked, setPicked] = useState(() => new Set())
   const [q, setQ] = useState('')
   const [busy, setBusy] = useState(false)
+  const [openRecipe, setOpenRecipe] = useState(null)
 
   const onList = useMemo(() => activeItemKeys(items), [items])
   const rows = useMemo(() => rankRegulars(master, q), [master, q])
+
+  // The open recipe has to be re-read from props each render, otherwise adding
+  // or removing an ingredient wouldn't show up until you closed and reopened.
+  const current = openRecipe ? recipes.find((r) => r.id === openRecipe) || null : null
+  if (current) {
+    return (
+      <RecipeDetail recipe={current} onList={onList} actions={recipeActions}
+                    onBack={() => setOpenRecipe(null)} onAdd={onAdd} />
+    )
+  }
 
   const toggle = (key) => setPicked((prev) => {
     const next = new Set(prev)
@@ -1556,15 +1667,29 @@ function RegularsSheet({ master, items, onAdd, onClose }) {
   }
 
   return (
-    <div className="sheet" role="dialog" aria-modal="true" aria-label="Your regulars">
+    <div className="sheet" role="dialog" aria-modal="true" aria-label="Add several items">
       <div className="sheet-head">
         <button className="btn icon" onClick={onClose} aria-label="Close"><Ico.back /></button>
         <div style={{ flex: 1, minWidth: 0 }}>
-          <h1>Your regulars</h1>
-          <div className="sub">Most-added first · tap to pick</div>
+          <h1>Add to your list</h1>
+          <div className="sub">
+            {tab === 'regulars' ? 'Most-added first · tap to pick' : 'A saved bundle, added in one tap'}
+          </div>
         </div>
       </div>
 
+      <div className="sheet-tabs">
+        <button className={tab === 'regulars' ? 'on' : ''} onClick={() => setTab('regulars')}>Regulars</button>
+        <button className={tab === 'recipes' ? 'on' : ''} onClick={() => setTab('recipes')}>
+          Recipes{recipes.length ? ` (${recipes.length})` : ''}
+        </button>
+      </div>
+
+      {tab === 'recipes' ? (
+        <RecipeList recipes={recipes} items={items} actions={recipeActions}
+                    onOpen={(r) => setOpenRecipe(r.id)} />
+      ) : (
+      <>
       <div className="sheet-body">
         <input className="input" placeholder="Search your regulars…" value={q}
                onChange={(e) => setQ(e.target.value)} autoComplete="off" />
@@ -1612,6 +1737,222 @@ function RegularsSheet({ master, items, onAdd, onClose }) {
           {busy ? 'Adding…'
             : picked.size === 0 ? 'Pick a few items'
             : `Add ${picked.size} item${picked.size === 1 ? '' : 's'}`}
+        </button>
+      </div>
+      </>
+      )}
+    </div>
+  )
+}
+
+/* The recipe index: what you've saved, and the one-tap way to make a new one
+   out of whatever is on the list right now — which is how recipes actually
+   get written. Nobody sits down to type out "Taco night" from scratch; they
+   notice they just built it. */
+function RecipeList({ recipes, items, actions, onOpen }) {
+  const [naming, setNaming] = useState(false)
+  const [name, setName] = useState('')
+  const [picked, setPicked] = useState(() => new Set())
+  const [busy, setBusy] = useState(false)
+
+  const candidates = items.filter((i) => !i.crossed_off)
+
+  async function save(e) {
+    e.preventDefault()
+    if (!name.trim() || busy) return
+    setBusy(true)
+    const chosen = candidates.filter((i) => picked.has(i.id))
+    const made = await actions.create(name, chosen)
+    setBusy(false)
+    if (made) { setNaming(false); setName(''); setPicked(new Set()) }
+  }
+
+  if (naming) {
+    return (
+      <div className="sheet-body">
+        <form onSubmit={save}>
+          <label className="field"><span>Recipe name</span>
+            <input className="input" autoFocus value={name} placeholder="Taco night"
+                   onChange={(e) => setName(e.target.value)} />
+          </label>
+
+          <p className="meta" style={{ margin: '0 0 8px' }}>
+            {candidates.length
+              ? 'Tick anything on the list now that belongs in it. You can add more later.'
+              : 'Nothing on the list to capture — save the name now and add ingredients next.'}
+          </p>
+
+          {candidates.length > 0 && (
+            <div className="rows" style={{ marginBottom: 12 }}>
+              {candidates.map((i) => {
+                const on = picked.has(i.id)
+                return (
+                  <div className="row" key={i.id}>
+                    <button type="button" className={'check' + (on ? ' on' : '')}
+                            aria-pressed={on}
+                            onClick={() => setPicked((prev) => {
+                              const next = new Set(prev)
+                              next.has(i.id) ? next.delete(i.id) : next.add(i.id)
+                              return next
+                            })}>
+                      {on && <Ico.check />}
+                    </button>
+                    <div className="body"><div className="nm">{i.name}</div></div>
+                    <span className="muted small">
+                      {formatQty(i.quantity)}{i.unit ? ` ${i.unit}` : ''}
+                    </span>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+
+          <div className="stack">
+            <button className="btn primary block" disabled={!name.trim() || busy}>
+              {busy ? 'Saving…' : `Save recipe${picked.size ? ` with ${picked.size} item${picked.size === 1 ? '' : 's'}` : ''}`}
+            </button>
+            <button type="button" className="btn block" onClick={() => setNaming(false)}>Cancel</button>
+          </div>
+        </form>
+      </div>
+    )
+  }
+
+  return (
+    <>
+      <div className="sheet-body">
+        {recipes.length === 0 ? (
+          <div className="empty">
+            <div className="big">No recipes yet</div>
+            Save a bundle of things you buy together — taco night, pancakes, a
+            camping trip — then add the whole lot in one tap.
+          </div>
+        ) : (
+          <div className="rows">
+            {recipes.map((r) => (
+              <div className="row" key={r.id}>
+                <div className="body" onClick={() => onOpen(r)}>
+                  <div className="nm">{r.name}</div>
+                  <div className="nt">
+                    {(r.recipe_items || []).length} ingredient{(r.recipe_items || []).length === 1 ? '' : 's'}
+                  </div>
+                </div>
+                <Ico.chev className="muted" />
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="sheet-foot">
+        <button className="btn primary block" onClick={() => setNaming(true)}>
+          <Ico.plus /> New recipe
+        </button>
+      </div>
+    </>
+  )
+}
+
+/* One recipe: tick what you still need (everything already on the list starts
+   unticked, so a half-built list doesn't get double-stocked) and tip it in. */
+function RecipeDetail({ recipe, onList, actions, onBack, onAdd }) {
+  const ings = useMemo(
+    () => [...(recipe.recipe_items || [])].sort((a, b) => (a.position || 0) - (b.position || 0)),
+    [recipe],
+  )
+  const [picked, setPicked] = useState(() =>
+    new Set(ings.filter((i) => !onList.has(itemKey(i.name))).map((i) => i.id)))
+  const [draft, setDraft] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  /* useState's initialiser runs once, so an ingredient added while this screen
+     is open would come up unticked — surprising right after you typed it. */
+  const seen = useRef(new Set(ings.map((i) => i.id)))
+  useEffect(() => {
+    const fresh = ings.filter((i) => !seen.current.has(i.id))
+    if (!fresh.length) return
+    for (const i of fresh) seen.current.add(i.id)
+    setPicked((prev) => new Set([...prev, ...fresh.map((i) => i.id)]))
+  }, [ings])
+
+  const toggle = (id) => setPicked((prev) => {
+    const next = new Set(prev)
+    next.has(id) ? next.delete(id) : next.add(id)
+    return next
+  })
+
+  async function submit() {
+    const chosen = ings.filter((i) => picked.has(i.id))
+    if (!chosen.length) return
+    setBusy(true)
+    await onAdd(chosen)
+  }
+
+  return (
+    <div className="sheet" role="dialog" aria-modal="true" aria-label={recipe.name}>
+      <div className="sheet-head">
+        <button className="btn icon" onClick={onBack} aria-label="Back"><Ico.back /></button>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <h1>{recipe.name}</h1>
+          <div className="sub">{ings.length} ingredient{ings.length === 1 ? '' : 's'}</div>
+        </div>
+        <button className="btn icon" aria-label="Rename recipe" title="Rename"
+                onClick={() => {
+                  const next = prompt('Rename this recipe:', recipe.name)
+                  if (next) actions.rename(recipe, next)
+                }}>
+          <Ico.gear />
+        </button>
+        <button className="btn icon" aria-label="Delete recipe" title="Delete"
+                onClick={() => actions.remove(recipe)}>
+          <Ico.trash />
+        </button>
+      </div>
+
+      <div className="sheet-body">
+        {ings.length === 0 ? (
+          <div className="empty">No ingredients yet — add some below.</div>
+        ) : (
+          <div className="rows">
+            {ings.map((i) => {
+              const already = onList.has(itemKey(i.name))
+              const on = picked.has(i.id)
+              return (
+                <div className={'row' + (already && !on ? ' done' : '')} key={i.id}>
+                  <button className={'check' + (on ? ' on' : '')} onClick={() => toggle(i.id)}
+                          aria-pressed={on} aria-label={`Include ${i.name}`}>
+                    {on && <Ico.check />}
+                  </button>
+                  <div className="body" onClick={() => toggle(i.id)}>
+                    <div className="nm">{i.name}</div>
+                    {already && <div className="nt">Already on the list</div>}
+                  </div>
+                  <span className="muted small">
+                    {formatQty(i.quantity)}{i.unit ? ` ${i.unit}` : ''}
+                  </span>
+                  <button className="btn icon" aria-label={`Remove ${i.name} from this recipe`}
+                          onClick={() => actions.removeItem(recipe, i)}>
+                    <Ico.trash />
+                  </button>
+                </div>
+              )
+            })}
+          </div>
+        )}
+
+        <form style={{ display: 'flex', gap: 8, marginTop: 12 }}
+              onSubmit={(e) => { e.preventDefault(); actions.addItem(recipe, draft); setDraft('') }}>
+          <input className="input" value={draft} placeholder="Add an ingredient…"
+                 onChange={(e) => setDraft(e.target.value)} autoComplete="off" />
+          <button className="btn" disabled={!draft.trim()} aria-label="Add ingredient"><Ico.plus /></button>
+        </form>
+      </div>
+
+      <div className="sheet-foot">
+        <button className="btn primary block" disabled={busy || picked.size === 0} onClick={submit}>
+          {busy ? 'Adding…'
+            : picked.size === 0 ? 'Nothing selected'
+            : `Add ${picked.size} item${picked.size === 1 ? '' : 's'} to the list`}
         </button>
       </div>
     </div>
