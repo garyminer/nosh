@@ -27,6 +27,13 @@
 const VERSION = '__BUILD__'
 const SHELL = 'nosh-shell-' + VERSION
 
+/* Photos live in their own cache, deliberately NOT versioned. The shell cache
+   is wiped on every deploy, and re-downloading every picture because a button
+   colour changed would be daft — item photos sit at immutable UUID paths, so a
+   cached copy is never stale. */
+const PHOTOS = 'nosh-photos'
+const isPhoto = (url) => url.pathname.includes('/storage/v1/object/public/')
+
 self.addEventListener('install', (event) => {
   // Take over as soon as possible rather than waiting for every tab to close.
   event.waitUntil(caches.open(SHELL).then(() => self.skipWaiting()))
@@ -36,7 +43,9 @@ self.addEventListener('activate', (event) => {
   event.waitUntil(
     (async () => {
       const names = await caches.keys()
-      await Promise.all(names.filter((n) => n !== SHELL).map((n) => caches.delete(n)))
+      await Promise.all(
+        names.filter((n) => n !== SHELL && n !== PHOTOS).map((n) => caches.delete(n))
+      )
       await self.clients.claim()
     })()
   )
@@ -52,7 +61,30 @@ self.addEventListener('fetch', (event) => {
   if (req.method !== 'GET') return
 
   const url = new URL(req.url)
-  if (url.origin !== self.location.origin) return   // Supabase et al: untouched
+
+  /* Item photos are the one cross-origin thing worth caching: they're public,
+     immutable, and wanted precisely where the signal isn't. Everything else on
+     Supabase — the API, realtime — is left alone, because a cached API read
+     would show stale data with no way to tell. */
+  if (isPhoto(url)) {
+    event.respondWith(
+      (async () => {
+        const cache = await caches.open(PHOTOS)
+        const hit = await cache.match(req)
+        if (hit) return hit
+        try {
+          const res = await fetch(req)
+          if (res && res.ok) cache.put(req, res.clone())
+          return res
+        } catch {
+          return new Response('', { status: 504, statusText: 'Offline' })
+        }
+      })()
+    )
+    return
+  }
+
+  if (url.origin !== self.location.origin) return   // Supabase API etc: untouched
 
   // Navigations: try the network so a deploy is picked up, fall back to the
   // cached shell when offline. The app is a hash router, so index.html serves

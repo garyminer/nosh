@@ -380,6 +380,67 @@ const whenText = (ts) => {
   return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
 }
 
+/* ---------------- photos --------------------------------------------
+
+   A phone photo is 3-8 MB. Uploading them raw would burn through the free
+   storage tier in about 150 pictures and take forever on shop wifi, so
+   everything is downscaled to a long edge of 1024px and re-encoded as JPEG
+   before it leaves the device — roughly 150 KB, still far more detail than
+   "which bottle was it" needs.
+   -------------------------------------------------------------------- */
+
+const PHOTO_BUCKET = 'nosh-photos'
+const PHOTO_MAX_EDGE = 1024
+const PHOTO_QUALITY = 0.75
+
+// createImageBitmap honours EXIF rotation and decodes off the main thread,
+// but older Safari lacks it — hence the <img> fallback, which matters because
+// this is a phone-first app.
+async function decodeImage(file) {
+  if (typeof createImageBitmap === 'function') {
+    try {
+      return await createImageBitmap(file, { imageOrientation: 'from-image' })
+    } catch { /* fall through */ }
+  }
+  const url = URL.createObjectURL(file)
+  try {
+    return await new Promise((resolve, reject) => {
+      const img = new Image()
+      img.onload = () => resolve(img)
+      img.onerror = () => reject(new Error("That file doesn't look like an image."))
+      img.src = url
+    })
+  } finally {
+    // Revoking immediately is safe: the decode has already finished.
+    setTimeout(() => URL.revokeObjectURL(url), 0)
+  }
+}
+
+async function shrinkImage(file) {
+  const src = await decodeImage(file)
+  const w0 = src.width || src.naturalWidth
+  const h0 = src.height || src.naturalHeight
+  if (!w0 || !h0) throw new Error("That image couldn't be read.")
+
+  const scale = Math.min(1, PHOTO_MAX_EDGE / Math.max(w0, h0))
+  const w = Math.max(1, Math.round(w0 * scale))
+  const h = Math.max(1, Math.round(h0 * scale))
+
+  const canvas = document.createElement('canvas')
+  canvas.width = w
+  canvas.height = h
+  const ctx = canvas.getContext('2d')
+  ctx.drawImage(src, 0, 0, w, h)
+  if (typeof src.close === 'function') src.close()
+
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', PHOTO_QUALITY))
+  if (!blob) throw new Error("That image couldn't be processed.")
+  return blob
+}
+
+const photoUrl = (path) =>
+  path ? supabase.storage.from(PHOTO_BUCKET).getPublicUrl(path).data.publicUrl : null
+
 /* ---------------- who else is on this list right now --------------- */
 
 /* Presence answers "is anyone looking at this list?", which is the thing worth
@@ -1209,6 +1270,9 @@ function ListScreen({ listId, session }) {
     const optimistic = {
       id: nextTempId(), list_id: listId, name: titleCase(clean), quantity: qty,
       unit: useUnit, note: useNote, category_id: catId, crossed_off: false,
+      // add_item copies this from the master list server-side; mirroring it
+      // here just means the thumbnail appears without waiting for the round trip.
+      photo_path: remembered?.photo_path || null,
       created_by: session.user.id, created_at: new Date().toISOString(),
       added_by: session.user.id, added_at: new Date().toISOString(),
     }
@@ -1965,6 +2029,10 @@ function ItemRow({ item, done, who, onToggle, onQty, onOpen }) {
       <button className={'check' + (done ? ' on' : '')} onClick={onToggle} aria-label={done ? 'Un-cross' : 'Cross off'}>
         {done && <Ico.check />}
       </button>
+      {item.photo_path && (
+        <img className="thumb" src={photoUrl(item.photo_path)} alt="" loading="lazy"
+             onClick={onOpen} />
+      )}
       <div className="body" onClick={onOpen}>
         <div className="nm">{item.name}</div>
         {item.note && <div className="nt">{item.note}</div>}
@@ -1988,6 +2056,80 @@ function ItemRow({ item, done, who, onToggle, onQty, onOpen }) {
 /* ============================================================
    Item detail
    ============================================================ */
+
+/* Attaching needs a connection: a multi-megabyte blob can't sit in the
+   localStorage outbox alongside the JSON ops. Viewing works offline, because
+   the bucket is public and the service worker caches what it has seen. */
+function PhotoField({ item, listId, onChange }) {
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
+  const fileRef = useRef(null)
+  const url = photoUrl(item.photo_path)
+
+  async function pick(e) {
+    const file = e.target.files?.[0]
+    e.target.value = ''            // so re-picking the same file still fires
+    if (!file) return
+    if (navigator.onLine === false) {
+      setErr('Adding a photo needs a connection. The rest of the list works offline.')
+      return
+    }
+    setBusy(true); setErr('')
+    try {
+      const blob = await shrinkImage(file)
+      const path = `${listId}/${(crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`)}.jpg`
+      const { error } = await supabase.storage.from(PHOTO_BUCKET)
+        .upload(path, blob, { contentType: 'image/jpeg', upsert: false })
+      if (error) throw error
+      await onChange(path, item.photo_path)
+    } catch (e2) {
+      setErr(e2.message || String(e2))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function remove() {
+    if (navigator.onLine === false) {
+      setErr('Removing a photo needs a connection.')
+      return
+    }
+    setBusy(true); setErr('')
+    try {
+      await onChange(null, item.photo_path)
+    } catch (e2) {
+      setErr(e2.message || String(e2))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="field">
+      <span>Photo <span className="muted" style={{ fontWeight: 500 }}>— remembered for next time</span></span>
+      {err && <div className="err" style={{ marginBottom: 8 }}>{err}</div>}
+
+      {url ? (
+        <div className="photo-box">
+          <img src={url} alt={`Photo of ${item.name}`} loading="lazy" />
+          <div className="photo-acts">
+            <button type="button" className="btn small" disabled={busy}
+                    onClick={() => fileRef.current?.click()}>Replace</button>
+            <button type="button" className="btn danger small" disabled={busy}
+                    onClick={remove}>Remove</button>
+          </div>
+        </div>
+      ) : (
+        <button type="button" className="btn block" disabled={busy}
+                onClick={() => fileRef.current?.click()}>
+          {busy ? 'Adding…' : 'Take or choose a photo'}
+        </button>
+      )}
+
+      <input ref={fileRef} type="file" accept="image/*" hidden onChange={pick} />
+    </div>
+  )
+}
 
 function ItemScreen({ itemId, session }) {
   const [item, setItem] = useState(null)
@@ -2053,6 +2195,25 @@ function ItemScreen({ itemId, session }) {
     setSaving(false)
     if (res.error) return setErr(res.error.message)
     navigate(`/l/${item.list_id}`)
+  }
+
+  /* Write the photo to this row AND to the remembered entry, so it comes back
+     next time. Same shape as how note/aisle/unit already flow. */
+  async function setPhoto(path, previousPath) {
+    const { error } = await supabase.from('items').update({ photo_path: path }).eq('id', item.id)
+    if (error) throw error
+    setItem((prev) => ({ ...prev, photo_path: path }))
+
+    // Exact match, not ilike: an item called "50% cocoa" would otherwise be a
+    // wildcard. A miss here is harmless — the row itself is already updated.
+    await supabase.from('master_items')
+      .update({ photo_path: path })
+      .eq('list_id', item.list_id).eq('name', item.name)
+
+    // Best effort: don't leave the replaced file sitting in the bucket.
+    if (previousPath && previousPath !== path) {
+      try { await supabase.storage.from(PHOTO_BUCKET).remove([previousPath]) } catch { /* ignore */ }
+    }
   }
 
   async function remove() {
@@ -2131,6 +2292,10 @@ function ItemScreen({ itemId, session }) {
           <textarea className="input" value={item.note || ''} placeholder="Brand, size, which one…"
                     onChange={(e) => setItem({ ...item, note: e.target.value })} />
         </label>
+
+        {!isTempId(item.id) && (
+          <PhotoField item={item} listId={item.list_id} onChange={setPhoto} />
+        )}
 
         <div className="stack">
           <button className="btn primary block" onClick={save} disabled={saving || !item.name.trim()}>
