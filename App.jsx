@@ -124,6 +124,113 @@ function matchesQuery(name, q) {
 
 const titleCase = (s) => s.replace(/\b[a-z]/g, (c) => c.toUpperCase())
 
+/* ---------------- quantities and units --------------------------------
+
+   Typing is the fast path, so "2 lbs chicken" should just work rather than
+   making anyone open a picker. The catch is that a leading number is only
+   sometimes a quantity: "7 up", "1000 island dressing" and "5 hour energy"
+   are item names. What makes parsing safe is refusing to treat a number as a
+   quantity unless a *recognised unit* follows it — "up", "island" and "hour"
+   aren't units, so those names survive intact. Bare "2 bananas" is therefore
+   left alone too; "bananas x2" is the unambiguous way to say it.
+   ---------------------------------------------------------------------- */
+
+const UNITS = [
+  { u: 'lb',     alias: ['lb', 'lbs', 'pound', 'pounds', '#'] },
+  { u: 'oz',     alias: ['oz', 'ounce', 'ounces'] },
+  { u: 'fl oz',  alias: ['floz'] },                    // "fl oz" is folded to one token first
+  { u: 'kg',     alias: ['kg', 'kgs', 'kilo', 'kilos', 'kilogram', 'kilograms'] },
+  { u: 'g',      alias: ['g', 'gram', 'grams'] },
+  { u: 'gal',    alias: ['gal', 'gallon', 'gallons'] },
+  { u: 'qt',     alias: ['qt', 'quart', 'quarts'] },
+  { u: 'pt',     alias: ['pt', 'pint', 'pints'] },
+  { u: 'L',      alias: ['l', 'liter', 'liters', 'litre', 'litres'] },
+  { u: 'mL',     alias: ['ml', 'milliliter', 'milliliters'] },
+  { u: 'dozen',  alias: ['dozen', 'dozens', 'doz'] },
+  { u: 'bunch',  alias: ['bunch', 'bunches'] },
+  { u: 'head',   alias: ['head', 'heads'] },
+  { u: 'clove',  alias: ['clove', 'cloves'] },
+  { u: 'bag',    alias: ['bag', 'bags'] },
+  { u: 'box',    alias: ['box', 'boxes'] },
+  { u: 'can',    alias: ['can', 'cans'] },
+  { u: 'jar',    alias: ['jar', 'jars'] },
+  { u: 'bottle', alias: ['bottle', 'bottles'] },
+  { u: 'pack',   alias: ['pack', 'packs', 'package', 'packages', 'pkg'] },
+  { u: 'loaf',   alias: ['loaf', 'loaves'] },
+  { u: 'roll',   alias: ['roll', 'rolls'] },
+]
+
+export const UNIT_NAMES = UNITS.map((x) => x.u)
+
+const UNIT_BY_ALIAS = (() => {
+  const m = new Map()
+  for (const { u, alias } of UNITS) {
+    m.set(u.toLowerCase(), u)
+    for (const a of alias) m.set(a, u)
+  }
+  return m
+})()
+
+const unitFromToken = (tok) =>
+  UNIT_BY_ALIAS.get(String(tok || '').toLowerCase().replace(/\.$/, '')) || null
+
+// PostgREST can hand back numeric as either a number or a string ("2.00"),
+// and "2.00" + 1 would quietly become "2.001". Everything goes through here.
+export function qtyNum(q) {
+  const n = Number(q)
+  return Number.isFinite(n) && n > 0 ? n : 1
+}
+export const formatQty = (q) => String(Math.round(qtyNum(q) * 100) / 100)
+
+/* Pull a quantity and unit out of typed text. Returns the name with those
+   parts removed. Shared by the add bar and the importer so both understand
+   exactly the same shorthand. */
+export function parseQuantityUnit(raw) {
+  const original = String(raw || '').trim()
+  if (!original) return { name: '', quantity: 1, unit: null }
+
+  // "12 fl oz" -> "12 floz", so the unit is a single token like every other.
+  let name = original.replace(/\bfl\.?\s*oz\b/gi, 'floz')
+  let quantity = null
+  let unit = null
+  const num = (s) => Number(String(s).replace(',', '.'))
+
+  // Explicit multipliers: "milk x2", "milk ×2", "milk (2)".
+  let m = name.match(/^(.*?)\s*[x×]\s*(\d+(?:[.,]\d+)?)$/i)
+  if (m) { name = m[1].trim(); quantity = num(m[2]) }
+  else if ((m = name.match(/^(.*?)\s*\((\d+(?:[.,]\d+)?)\)$/))) { name = m[1].trim(); quantity = num(m[2]) }
+
+  // Leading: "2 lbs of chicken", "2lb chicken", "3 dozen eggs".
+  if ((m = name.match(/^(\d+(?:[.,]\d+)?)\s*([a-z#]+\.?)\s+(.+)$/i))) {
+    const u = unitFromToken(m[2])
+    if (u) {
+      if (quantity === null) quantity = num(m[1])
+      unit = u
+      name = m[3].replace(/^of\s+/i, '').trim()
+    }
+  }
+
+  // Trailing: "chicken 2 lbs".
+  if (unit === null && (m = name.match(/^(.+?)\s+(\d+(?:[.,]\d+)?)\s*([a-z#]+\.?)$/i))) {
+    const u = unitFromToken(m[3])
+    if (u) {
+      if (quantity === null) quantity = num(m[2])
+      unit = u
+      name = m[1].trim()
+    }
+  }
+
+  // If stripping left nothing behind, the text was the name all along.
+  if (!name) return { name: original, quantity: 1, unit: null }
+
+  const q = quantity === null ? 1 : quantity
+  return {
+    name,
+    quantity: Number.isFinite(q) && q > 0 ? Math.round(q * 100) / 100 : 1,
+    unit,
+  }
+}
+
 /* ---------------- telling one item from the same item typed twice ---------
 
    Two levels, deliberately:
@@ -1060,7 +1167,8 @@ function ListScreen({ listId, session }) {
 
   /* ---- actions ---- */
 
-  async function addItem(name, categoryId = null, note = null) {
+  async function addItem(name, opts = {}) {
+    const { categoryId = null, note = null, unit = null, quantity = 1 } = opts
     const clean = name.trim()
     if (!clean) return
     setDraft('')
@@ -1069,7 +1177,7 @@ function ListScreen({ listId, session }) {
     // Same item by any spelling — case, punctuation or plural. Bump, don't duplicate.
     const key = itemKey(clean)
     const existing = active.find((a) => itemKey(a.name) === key)
-    if (existing) return setQuantity(existing, existing.quantity + 1)
+    if (existing) return setQuantity(existing, qtyNum(existing.quantity) + qtyNum(quantity), unit || existing.unit)
 
     // Crossed off already? Un-cross it instead of duplicating.
     const crossed = done.find((a) => itemKey(a.name) === key)
@@ -1077,23 +1185,26 @@ function ListScreen({ listId, session }) {
 
     const remembered = master.find((m) => itemKey(m.name) === key)
     const catId = categoryId || remembered?.category_id || guessCategoryId(clean, cats)
+    const useUnit = unit || remembered?.unit || null
+    const useNote = note || remembered?.note || null
+    const qty = qtyNum(quantity)
 
     const optimistic = {
-      id: `tmp-${Date.now()}`, list_id: listId, name: titleCase(clean), quantity: 1,
-      note: note || remembered?.note || null, category_id: catId, crossed_off: false,
+      id: `tmp-${Date.now()}`, list_id: listId, name: titleCase(clean), quantity: qty,
+      unit: useUnit, note: useNote, category_id: catId, crossed_off: false,
       created_by: session.user.id, created_at: new Date().toISOString(),
       added_by: session.user.id, added_at: new Date().toISOString(),
     }
     setItems((prev) => [...prev, optimistic])
 
     const args = {
-      p_list_id: listId, p_name: titleCase(clean), p_quantity: 1,
-      p_category_id: catId, p_note: note || remembered?.note || null,
+      p_list_id: listId, p_name: titleCase(clean), p_quantity: qty,
+      p_category_id: catId, p_note: useNote, p_unit: useUnit,
     }
     const res = await sendOrQueue(
       {
         k: 'add', tempId: optimistic.id, listId,
-        name: args.p_name, quantity: 1, categoryId: catId, note: args.p_note,
+        name: args.p_name, quantity: qty, categoryId: catId, note: useNote, unit: useUnit,
       },
       () => supabase.rpc('add_item', args),
     )
@@ -1107,7 +1218,7 @@ function ListScreen({ listId, session }) {
     setMaster((prev) => {
       const hit = prev.find((m) => itemKey(m.name) === key)
       if (hit) return prev.map((m) => (m === hit ? { ...m, use_count: m.use_count + 1 } : m))
-      return [{ id: `m-${Date.now()}`, list_id: listId, name: titleCase(clean), category_id: catId, note: null, use_count: 1 }, ...prev]
+      return [{ id: `m-${Date.now()}`, list_id: listId, name: titleCase(clean), category_id: catId, note: null, unit: useUnit, use_count: 1 }, ...prev]
     })
 
     // Not the same key, but one typo away from something? Offer to fold them
@@ -1191,12 +1302,14 @@ function ListScreen({ listId, session }) {
     if (res.error) { setErr(res.error.message); load() }
   }
 
-  async function setQuantity(item, q) {
-    const n = Math.max(1, q)
-    setItems((prev) => prev.map((p) => (p.id === item.id ? { ...p, quantity: n } : p)))
+  async function setQuantity(item, q, unit) {
+    const n = Math.round(Math.max(0.01, Number(q) || 1) * 100) / 100
+    const patch = { quantity: n }
+    if (unit !== undefined && unit !== item.unit) patch.unit = unit || null
+    setItems((prev) => prev.map((p) => (p.id === item.id ? { ...p, ...patch } : p)))
     const res = await sendOrQueue(
-      { k: 'update', id: item.id, patch: { quantity: n } },
-      () => supabase.from('items').update({ quantity: n }).eq('id', item.id),
+      { k: 'update', id: item.id, patch },
+      () => supabase.from('items').update(patch).eq('id', item.id),
     )
     if (res.error) { setErr(res.error.message); load() }
   }
@@ -1319,8 +1432,11 @@ function ListScreen({ listId, session }) {
           <div className="inner">
             {suggestions.map((s) => (
               <button key={s.id} onMouseDown={(e) => e.preventDefault()}
-                      onClick={() => { addItem(s.name, s.category_id, s.note); inputRef.current?.focus() }}>
-                <span className="s-nm">{s.name}</span>
+                      onClick={() => {
+                        addItem(s.name, { categoryId: s.category_id, note: s.note, unit: s.unit })
+                        inputRef.current?.focus()
+                      }}>
+                <span className="s-nm">{s.name}{s.unit ? <span className="muted"> · {s.unit}</span> : null}</span>
                 <span className="s-cat">{catById[s.category_id]?.name || ''}</span>
               </button>
             ))}
@@ -1329,8 +1445,12 @@ function ListScreen({ listId, session }) {
       )}
 
       <div className="addbar">
-        <form className="inner" onSubmit={(e) => { e.preventDefault(); addItem(draft) }}>
-          <input ref={inputRef} className="input" placeholder="Add an item…" value={draft}
+        <form className="inner" onSubmit={(e) => {
+          e.preventDefault()
+          const p = parseQuantityUnit(draft)
+          addItem(p.name, { quantity: p.quantity, unit: p.unit })
+        }}>
+          <input ref={inputRef} className="input" placeholder="Add an item…  (try “2 lbs chicken”)" value={draft}
                  onChange={(e) => setDraft(e.target.value)}
                  onFocus={() => setFocused(true)}
                  onBlur={() => setTimeout(() => setFocused(false), 120)}
@@ -1355,12 +1475,15 @@ function ItemRow({ item, done, who, onToggle, onQty, onOpen }) {
       {who && <Avatar id={item.added_by} label={who} />}
       {!done && (
         <div className="qty">
-          <button onClick={() => onQty(item.quantity - 1)} disabled={item.quantity <= 1} aria-label="Fewer">−</button>
-          <span className="n">{item.quantity}</span>
-          <button onClick={() => onQty(item.quantity + 1)} aria-label="More">+</button>
+          <button onClick={() => onQty(qtyNum(item.quantity) - 1)} disabled={qtyNum(item.quantity) <= 1} aria-label="Fewer">−</button>
+          <span className="n">
+            {formatQty(item.quantity)}
+            {item.unit && <span className="u">{item.unit}</span>}
+          </span>
+          <button onClick={() => onQty(qtyNum(item.quantity) + 1)} aria-label="More">+</button>
         </div>
       )}
-      {done && <span className="muted small">×{item.quantity}</span>}
+      {done && <span className="muted small">×{formatQty(item.quantity)}{item.unit ? ` ${item.unit}` : ''}</span>}
     </div>
   )
 }
@@ -1411,7 +1534,8 @@ function ItemScreen({ itemId, session }) {
     setSaving(true); setErr('')
     const patch = {
       name: item.name.trim(),
-      quantity: Math.max(1, item.quantity),
+      quantity: Math.round(Math.max(0.01, qtyNum(item.quantity)) * 100) / 100,
+      unit: item.unit || null,
       note: item.note?.trim() || null,
       category_id: item.category_id || null,
     }
@@ -1425,7 +1549,7 @@ function ItemScreen({ itemId, session }) {
       try {
         await supabase.rpc('remember_item', {
           p_list_id: item.list_id, p_name: patch.name,
-          p_category_id: patch.category_id, p_note: patch.note,
+          p_category_id: patch.category_id, p_note: patch.note, p_unit: patch.unit,
         })
       } catch { /* the item itself saved; the autocomplete hint can wait */ }
     }
@@ -1481,10 +1605,21 @@ function ItemScreen({ itemId, session }) {
         </label>
 
         <label className="field"><span>How many</span></label>
-        <div className="qty" style={{ marginBottom: 14 }}>
-          <button onClick={() => setItem({ ...item, quantity: Math.max(1, item.quantity - 1) })}>−</button>
-          <span className="n" style={{ fontSize: 18, minWidth: 40 }}>{item.quantity}</span>
-          <button onClick={() => setItem({ ...item, quantity: item.quantity + 1 })}>+</button>
+        <div className="qty-row">
+          <div className="qty">
+            <button onClick={() => setItem({ ...item, quantity: Math.max(0.01, Math.round((qtyNum(item.quantity) - 1) * 100) / 100) })}>−</button>
+            <input className="input qty-input" type="number" inputMode="decimal" min="0.01" step="0.25"
+                   value={formatQty(item.quantity)}
+                   onChange={(e) => setItem({ ...item, quantity: e.target.value })} />
+            <button onClick={() => setItem({ ...item, quantity: Math.round((qtyNum(item.quantity) + 1) * 100) / 100 })}>+</button>
+          </div>
+          <select className="input unit-select" value={item.unit || ''}
+                  onChange={(e) => setItem({ ...item, unit: e.target.value || null })}
+                  aria-label="Unit">
+            <option value="">(just a count)</option>
+            {UNIT_NAMES.map((u) => <option key={u} value={u}>{u}</option>)}
+            {item.unit && !UNIT_NAMES.includes(item.unit) && <option value={item.unit}>{item.unit}</option>}
+          </select>
         </div>
 
         <label className="field"><span>Aisle / category</span>
@@ -1753,7 +1888,8 @@ function parseImportJson(text) {
       if (typeof it === 'string') return { name: it.trim(), quantity: 1, category: null, note: null, crossed: false }
       return {
         name: String(it.name || it.value || '').trim(),
-        quantity: Math.max(1, parseInt(it.quantity, 10) || 1),
+        quantity: Math.max(0.01, Number(it.quantity) || 1),
+        unit: it.unit ? String(it.unit).trim() : null,
         category: it.category ? String(it.category).trim() : null,
         note: it.note ? String(it.note).trim() : null,
         crossed: !!it.crossed,
@@ -1786,14 +1922,13 @@ function parseImportText(text) {
     const noteSplit = item.split(/\s+(?:--|—)\s+/)
     if (noteSplit.length > 1) { item = noteSplit[0]; note = noteSplit.slice(1).join(' - ').trim() }
 
-    let quantity = 1
-    let m = item.match(/^(.*?)\s*[x×]\s*(\d+)$/i)
-    if (m) { item = m[1]; quantity = parseInt(m[2], 10) }
-    else if ((m = item.match(/^(.*?)\s*\((\d+)\)$/))) { item = m[1]; quantity = parseInt(m[2], 10) }
-
-    item = item.trim()
-    if (!item) continue
-    currentList.items.push({ name: item, quantity: Math.max(1, quantity), category: currentCategory, note, crossed: false })
+    // Same shorthand the add bar understands: "x2", "(2)", "2 lbs of chicken".
+    const parsed = parseQuantityUnit(item)
+    if (!parsed.name) continue
+    currentList.items.push({
+      name: parsed.name, quantity: parsed.quantity, unit: parsed.unit,
+      category: currentCategory, note, crossed: false,
+    })
   }
   return lists.filter((l) => l.items.length)
 }
@@ -1890,14 +2025,15 @@ function ImportScreen() {
 
           if (it.crossed) {
             const { error } = await supabase.rpc('remember_item', {
-              p_list_id: list.id, p_name: titleCase(it.name), p_category_id: categoryId, p_note: it.note || null,
+              p_list_id: list.id, p_name: titleCase(it.name), p_category_id: categoryId,
+              p_note: it.note || null, p_unit: it.unit || null,
             })
             if (error) throw error
             remembered++
           } else {
             const { error } = await supabase.rpc('add_item', {
               p_list_id: list.id, p_name: titleCase(it.name), p_quantity: it.quantity,
-              p_category_id: categoryId, p_note: it.note || null,
+              p_category_id: categoryId, p_note: it.note || null, p_unit: it.unit || null,
             })
             if (error) throw error
             added++

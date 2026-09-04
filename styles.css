@@ -229,6 +229,15 @@ textarea.input { min-height: 78px; resize: vertical; }
   display: grid; place-items: center;
 }
 .qty .n { min-width: 22px; text-align: center; font-weight: 700; font-variant-numeric: tabular-nums; }
+.qty .n .u { display: block; font-size: 10px; font-weight: 650; color: var(--muted); letter-spacing: .02em; }
+
+/* item detail: stepper + unit picker on one line */
+.qty-row { display: flex; gap: 8px; align-items: center; margin-bottom: 14px; }
+.qty-input {
+  width: 74px; text-align: center; font-weight: 700; font-variant-numeric: tabular-nums;
+  padding: 8px 6px; border-radius: 9px;
+}
+.unit-select { flex: 1; min-width: 0; }
 
 /* ---------- add bar (sticky bottom) ---------- */
 .addbar {

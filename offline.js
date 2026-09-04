@@ -186,6 +186,8 @@ async function applyOp(op) {
         p_quantity: op.quantity ?? 1,
         p_category_id: op.categoryId ?? null,
         p_note: op.note ?? null,
+        // Ops queued before units existed simply have no unit.
+        p_unit: op.unit ?? null,
       })
       if (error) return isNetworkError(error) ? 'retry' : 'drop'
       if (op.tempId && data?.id) rememberId(op.tempId, data.id)
