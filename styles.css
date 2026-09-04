@@ -132,6 +132,30 @@ textarea.input { min-height: 78px; resize: vertical; }
   display: grid; place-items: center; font-weight: 750; font-size: 14px;
 }
 
+/* ---------- who else is on this list ---------- */
+.presence {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 9px 12px; margin-bottom: 12px;
+  background: var(--raised); border: 1px solid var(--line); border-radius: var(--radius);
+  font-size: 13px; color: var(--muted);
+}
+.presence .faces { display: flex; }
+.presence .faces .who + .who { margin-left: -7px; }   /* overlap, like a stack of chips */
+.presence .txt { flex: 1; min-width: 0; display: flex; align-items: center; gap: 7px; }
+.presence .pulse {
+  flex: none; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--muted);
+}
+.presence.active { border-color: color-mix(in srgb, var(--ok) 40%, var(--line)); }
+.presence.active .pulse { background: var(--ok); animation: nosh-pulse 2s ease-in-out infinite; }
+@keyframes nosh-pulse {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 color-mix(in srgb, var(--ok) 55%, transparent); }
+  50%      { opacity: .75; box-shadow: 0 0 0 5px color-mix(in srgb, var(--ok) 0%, transparent); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .presence.active .pulse { animation: none; }
+}
+
 /* Wake-lock toggle: lit when the screen is being held on. */
 .btn.icon.awake { color: var(--accent-text); background: var(--accent-soft); border-color: transparent; }
 

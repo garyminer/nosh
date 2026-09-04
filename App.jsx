@@ -243,10 +243,11 @@ function avatarHue(id, label) {
   return h
 }
 
-function Avatar({ id, label, size = 24 }) {
+function Avatar({ id, label, size = 24, title }) {
   const hue = avatarHue(id, label)
+  const text = title || `Added by ${label}`
   return (
-    <span className="who" title={`Added by ${label}`} aria-label={`Added by ${label}`}
+    <span className="who" title={text} aria-label={text}
           style={{ width: size, height: size, fontSize: Math.round(size * 0.46), '--h': String(hue) }}>
       {initialOf(label)}
     </span>
@@ -261,6 +262,71 @@ const whenText = (ts) => {
   if (days === 1) return 'yesterday'
   if (days < 7) return `${days} days ago`
   return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+}
+
+/* ---------------- who else is on this list right now --------------- */
+
+/* Presence answers "is anyone looking at this list?", which is the thing worth
+   knowing: if Annette is at the store, adding milk in the next two minutes is
+   the difference between getting milk and not.
+
+   "Shopping" vs "just has it open" can't come from the database — there's no
+   crossed_by column to attribute a cross-off to a person. It doesn't need one:
+   each client knows what *it* just did, so a device that has crossed something
+   off recently says so in its own presence payload. */
+const SHOPPING_WINDOW_MS = 30 * 60 * 1000
+
+function readPresence(channel, meId) {
+  let state = {}
+  try { state = channel.presenceState() } catch { return [] }
+  const out = []
+  for (const [userId, metas] of Object.entries(state || {})) {
+    if (userId === meId) continue            // you know you're here
+    const list = Array.isArray(metas) ? metas : []
+    out.push({
+      userId,
+      shopping: list.some((m) => m && m.shopping),
+      name: (list.find((m) => m && m.name) || {}).name || null,
+    })
+  }
+  return out
+}
+
+/* Anyone mid-shop is what you care about, so they get named first and the
+   people merely browsing don't dilute the sentence. */
+function presenceSentence(present, nameOf) {
+  if (!present.length) return ''
+  const shopping = present.filter((p) => p.shopping)
+  const featured = shopping.length ? shopping : present
+  const names = featured.map(nameOf)
+
+  const who = names.length === 1 ? names[0]
+    : names.length === 2 ? `${names[0]} and ${names[1]}`
+    : `${names[0]}, ${names[1]} and ${names.length - 2} more`
+  const plural = names.length > 1
+  const what = shopping.length
+    ? `${plural ? 'are' : 'is'} shopping right now`
+    : `${plural ? 'have' : 'has'} this list open`
+  return `${who} ${what}`
+}
+
+function PresenceBar({ present, nameById }) {
+  if (!present.length) return null
+
+  const nameOf = (p) => nameById[p.userId] || p.name || 'Someone'
+  const shopping = present.filter((p) => p.shopping)
+
+  return (
+    <div className={'presence' + (shopping.length ? ' active' : '')}>
+      <span className="faces">
+        {present.slice(0, 4).map((p) => (
+          <Avatar key={p.userId} id={p.userId} label={nameOf(p)} size={22}
+                  title={`${nameOf(p)} ${p.shopping ? 'is shopping right now' : 'has this list open'}`} />
+        ))}
+      </span>
+      <span className="txt"><span className="pulse" />{presenceSentence(present, nameOf)}</span>
+    </div>
+  )
 }
 
 /* ---------------- keeping the screen on while you shop --------------- */
@@ -793,7 +859,13 @@ function ListScreen({ listId, session }) {
   const [focused, setFocused] = useState(false)
   const [nearby, setNearby] = useState(null)   // pending "did you mean …?" offer
   const [keepAwake, setKeepAwake] = useState(readWakePref)
+  const [present, setPresent] = useState([])
+  const [shopping, setShopping] = useState(false)
   const inputRef = useRef(null)
+  const chanRef = useRef(null)
+  const subscribedRef = useRef(false)
+  const trackRef = useRef({ name: '', shopping: false })
+  const shoppingTimer = useRef(null)
 
   useWakeLock(keepAwake)
   useEffect(() => { writeWakePref(keepAwake) }, [keepAwake])
@@ -845,10 +917,14 @@ function ListScreen({ listId, session }) {
     return () => window.removeEventListener('nosh:synced', on)
   }, [load])
 
-  // live sync: anyone else's changes show up here
+  // Live sync + presence share one channel: two would mean two websockets per
+  // open list, and Supabase's free tier counts connections.
   useEffect(() => {
+    const me = session.user.id
+    subscribedRef.current = false
+
     const ch = supabase
-      .channel(`list-${listId}`)
+      .channel(`list-${listId}`, { config: { presence: { key: me } } })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'items', filter: `list_id=eq.${listId}` },
         async () => {
           const { data } = await supabase.from('items').select('*').eq('list_id', listId)
@@ -862,9 +938,22 @@ function ListScreen({ listId, session }) {
             if (p) setPeople(p)
           }
         })
-      .subscribe()
-    return () => { supabase.removeChannel(ch) }
-  }, [listId])
+      // 'sync' already fires for joins and leaves, so it's the only one needed.
+      .on('presence', { event: 'sync' }, () => setPresent(readPresence(ch, me)))
+      .subscribe((status) => {
+        if (status !== 'SUBSCRIBED') return
+        subscribedRef.current = true
+        Promise.resolve(ch.track(trackRef.current)).catch(() => {})
+      })
+
+    chanRef.current = ch
+    return () => {
+      subscribedRef.current = false
+      chanRef.current = null
+      setPresent([])
+      supabase.removeChannel(ch)
+    }
+  }, [listId, session.user.id])
 
   // Keep the offline copy current after every change. master_items is trimmed
   // because it's the only unbounded piece and localStorage is not.
@@ -882,6 +971,30 @@ function ListScreen({ listId, session }) {
     () => Object.fromEntries(people.map((p) => [p.user_id, personLabel(p)])),
     [people],
   )
+  /* Broadcast who we are and whether we're mid-shop. Re-sent whenever either
+     changes — the name arrives a moment after the channel does, and the
+     shopping flag flips the first time something gets crossed off. */
+  const myPresence = useMemo(() => ({
+    name: nameById[session.user.id] || (session.user.email || '').split('@')[0] || 'Someone',
+    shopping,
+  }), [nameById, session.user.id, session.user.email, shopping])
+
+  useEffect(() => {
+    trackRef.current = myPresence
+    if (subscribedRef.current && chanRef.current) {
+      Promise.resolve(chanRef.current.track(myPresence)).catch(() => {})
+    }
+  }, [myPresence])
+
+  // Crossing something off is the tell that you're actually at the store.
+  // It lapses on its own so a morning's shop doesn't still say "shopping" at night.
+  const markShopping = useCallback(() => {
+    setShopping(true)
+    clearTimeout(shoppingTimer.current)
+    shoppingTimer.current = setTimeout(() => setShopping(false), SHOPPING_WINDOW_MS)
+  }, [])
+  useEffect(() => () => clearTimeout(shoppingTimer.current), [])
+
   const showWho = people.length > 1
   const whoLabel = (userId) => {
     if (!userId) return null
@@ -1062,6 +1175,7 @@ function ListScreen({ listId, session }) {
   async function toggle(item) {
     const next = !item.crossed_off
     const now = new Date().toISOString()
+    if (next) markShopping()
     // Un-crossing puts the item back on the to-buy list, so you become its
     // adder. A DB trigger does the real work; this just keeps the UI honest
     // until the write lands.
@@ -1140,6 +1254,8 @@ function ListScreen({ listId, session }) {
 
       <div className="wrap">
         {err && <div className="err">{err}</div>}
+
+        <PresenceBar present={present} nameById={nameById} />
 
         {active.length === 0 && done.length === 0 && (
           <div className="empty">
