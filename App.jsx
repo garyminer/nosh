@@ -49,6 +49,8 @@ const Ico = {
   chev: (p) => <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" {...p}><polyline points="9 18 15 12 9 6"/></svg>,
   up: (p) => <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" {...p}><polyline points="18 15 12 9 6 15"/></svg>,
   down: (p) => <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" {...p}><polyline points="6 9 12 15 18 9"/></svg>,
+  sun: (p) => <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...p}><circle cx="12" cy="12" r="4.2"/><line x1="12" y1="1.6" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.4"/><line x1="4.2" y1="4.2" x2="5.9" y2="5.9"/><line x1="18.1" y1="18.1" x2="19.8" y2="19.8"/><line x1="1.6" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.4" y2="12"/><line x1="4.2" y1="19.8" x2="5.9" y2="18.1"/><line x1="18.1" y1="5.9" x2="19.8" y2="4.2"/></svg>,
+  moon: (p) => <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...p}><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>,
 }
 
 function Logo({ size = 34 }) {
@@ -259,6 +261,81 @@ const whenText = (ts) => {
   if (days === 1) return 'yesterday'
   if (days < 7) return `${days} days ago`
   return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+}
+
+/* ---------------- keeping the screen on while you shop --------------- */
+
+/* The screen going dark mid-aisle, every time, is the single most annoying
+   thing about using a phone as a shopping list.
+
+   Two things make this well-behaved rather than a battery bug:
+
+   - The browser drops a screen wake lock whenever the page is hidden, so it
+     has to be re-taken on the way back. That's not a nicety, it's required.
+   - A list left open face-up on the counter would otherwise hold the screen
+     on forever, so the lock is released after a stretch with no interaction
+     and retaken the moment you touch the screen again. Re-taking is instant
+     and invisible, so an early release mid-trip costs nothing.
+*/
+const WAKE_IDLE_MS = 10 * 60 * 1000
+const WAKE_PREF_KEY = 'nosh:keep-awake'
+const wakeLockSupported = typeof navigator !== 'undefined' && 'wakeLock' in navigator
+
+function readWakePref() {
+  try { return localStorage.getItem(WAKE_PREF_KEY) !== 'off' } catch { return true }
+}
+function writeWakePref(on) {
+  try { localStorage.setItem(WAKE_PREF_KEY, on ? 'on' : 'off') } catch { /* private mode */ }
+}
+
+function useWakeLock(enabled) {
+  useEffect(() => {
+    if (!enabled || !wakeLockSupported) return
+
+    let cancelled = false
+    let sentinel = null
+    let idleTimer = null
+
+    const release = async () => {
+      const s = sentinel
+      sentinel = null
+      if (s) { try { await s.release() } catch { /* already gone */ } }
+    }
+
+    const acquire = async () => {
+      if (cancelled || sentinel || document.visibilityState !== 'visible') return
+      try {
+        const s = await navigator.wakeLock.request('screen')
+        if (cancelled) { try { await s.release() } catch { /* ignore */ } ; return }
+        sentinel = s
+        // Fires when the browser takes it back (page hidden, battery saver).
+        s.addEventListener('release', () => { if (sentinel === s) sentinel = null })
+      } catch {
+        // NotAllowedError when hidden, or blocked by policy / low battery.
+        // Nothing to do: the screen just behaves as it did before.
+      }
+    }
+
+    const onActivity = () => {
+      clearTimeout(idleTimer)
+      idleTimer = setTimeout(release, WAKE_IDLE_MS)
+      acquire()
+    }
+    const onVisibility = () => { if (document.visibilityState === 'visible') onActivity() }
+
+    onActivity()
+    document.addEventListener('visibilitychange', onVisibility)
+    const events = ['pointerdown', 'keydown', 'scroll']
+    for (const ev of events) window.addEventListener(ev, onActivity, { passive: true })
+
+    return () => {
+      cancelled = true
+      clearTimeout(idleTimer)
+      document.removeEventListener('visibilitychange', onVisibility)
+      for (const ev of events) window.removeEventListener(ev, onActivity)
+      release()
+    }
+  }, [enabled])
 }
 
 /* ---------------- offline plumbing --------------- */
@@ -715,7 +792,11 @@ function ListScreen({ listId, session }) {
   const [draft, setDraft] = useState('')
   const [focused, setFocused] = useState(false)
   const [nearby, setNearby] = useState(null)   // pending "did you mean …?" offer
+  const [keepAwake, setKeepAwake] = useState(readWakePref)
   const inputRef = useRef(null)
+
+  useWakeLock(keepAwake)
+  useEffect(() => { writeWakePref(keepAwake) }, [keepAwake])
   const knownPeopleRef = useRef([])
   useEffect(() => { knownPeopleRef.current = people.map((p) => p.user_id) }, [people])
 
@@ -1041,6 +1122,19 @@ function ListScreen({ listId, session }) {
           <h1>{list.name}</h1>
           <div className="sub">{active.length} to buy{done.length ? ` · ${done.length} crossed off` : ''}</div>
         </div>
+        {wakeLockSupported && (
+          <button
+            className={'btn icon' + (keepAwake ? ' awake' : '')}
+            onClick={() => setKeepAwake((v) => !v)}
+            aria-pressed={keepAwake}
+            title={keepAwake
+              ? 'Screen stays on while you use this list. Tap to let it sleep normally.'
+              : 'Screen sleeps normally. Tap to keep it on while you shop.'}
+            aria-label={keepAwake ? 'Let the screen sleep' : 'Keep the screen on'}
+          >
+            {keepAwake ? <Ico.sun /> : <Ico.moon />}
+          </button>
+        )}
         <button className="btn icon" onClick={() => navigate(`/l/${listId}/settings`)} aria-label="List settings"><Ico.gear /></button>
       </div>
 

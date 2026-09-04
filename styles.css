@@ -132,6 +132,9 @@ textarea.input { min-height: 78px; resize: vertical; }
   display: grid; place-items: center; font-weight: 750; font-size: 14px;
 }
 
+/* Wake-lock toggle: lit when the screen is being held on. */
+.btn.icon.awake { color: var(--accent-text); background: var(--accent-soft); border-color: transparent; }
+
 /* ---------- offline / sync bar ---------- */
 .syncbar {
   position: sticky; top: 0; z-index: 40;
