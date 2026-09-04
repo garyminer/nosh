@@ -51,6 +51,7 @@ const Ico = {
   down: (p) => <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" {...p}><polyline points="6 9 12 15 18 9"/></svg>,
   sun: (p) => <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...p}><circle cx="12" cy="12" r="4.2"/><line x1="12" y1="1.6" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.4"/><line x1="4.2" y1="4.2" x2="5.9" y2="5.9"/><line x1="18.1" y1="18.1" x2="19.8" y2="19.8"/><line x1="1.6" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.4" y2="12"/><line x1="4.2" y1="19.8" x2="5.9" y2="18.1"/><line x1="18.1" y1="5.9" x2="19.8" y2="4.2"/></svg>,
   moon: (p) => <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...p}><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>,
+  star: (p) => <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...p}><polygon points="12 2.6 15 9 22 9.9 17 14.7 18.3 21.6 12 18.3 5.7 21.6 7 14.7 2 9.9 9 9"/></svg>,
 }
 
 function Logo({ size = 34 }) {
@@ -173,6 +174,14 @@ const UNIT_BY_ALIAS = (() => {
 
 const unitFromToken = (tok) =>
   UNIT_BY_ALIAS.get(String(tok || '').toLowerCase().replace(/\.$/, '')) || null
+
+/* Local ids for rows that haven't reached the server yet. A bare Date.now()
+   is not enough: adding several items at once (ticking a batch of regulars,
+   or fast typing while offline) queues them inside the same millisecond, and
+   two rows sharing a temp id would collide as React keys AND scramble the
+   outbox's temp-id → real-id mapping. */
+let tempSeq = 0
+const nextTempId = (prefix = 'tmp') => `${prefix}-${Date.now().toString(36)}-${(tempSeq++).toString(36)}`
 
 // PostgREST can hand back numeric as either a number or a string ("2.00"),
 // and "2.00" + 1 would quietly become "2.001". Everything goes through here.
@@ -968,6 +977,7 @@ function ListScreen({ listId, session }) {
   const [keepAwake, setKeepAwake] = useState(readWakePref)
   const [present, setPresent] = useState([])
   const [shopping, setShopping] = useState(false)
+  const [showRegulars, setShowRegulars] = useState(false)
   const inputRef = useRef(null)
   const chanRef = useRef(null)
   const subscribedRef = useRef(false)
@@ -1190,7 +1200,7 @@ function ListScreen({ listId, session }) {
     const qty = qtyNum(quantity)
 
     const optimistic = {
-      id: `tmp-${Date.now()}`, list_id: listId, name: titleCase(clean), quantity: qty,
+      id: nextTempId(), list_id: listId, name: titleCase(clean), quantity: qty,
       unit: useUnit, note: useNote, category_id: catId, crossed_off: false,
       created_by: session.user.id, created_at: new Date().toISOString(),
       added_by: session.user.id, added_at: new Date().toISOString(),
@@ -1218,7 +1228,7 @@ function ListScreen({ listId, session }) {
     setMaster((prev) => {
       const hit = prev.find((m) => itemKey(m.name) === key)
       if (hit) return prev.map((m) => (m === hit ? { ...m, use_count: m.use_count + 1 } : m))
-      return [{ id: `m-${Date.now()}`, list_id: listId, name: titleCase(clean), category_id: catId, note: null, unit: useUnit, use_count: 1 }, ...prev]
+      return [{ id: nextTempId('m'), list_id: listId, name: titleCase(clean), category_id: catId, note: null, unit: useUnit, use_count: 1 }, ...prev]
     })
 
     // Not the same key, but one typo away from something? Offer to fold them
@@ -1280,6 +1290,15 @@ function ListScreen({ listId, session }) {
       try {
         await supabase.from('master_items').delete().eq('list_id', listId).eq('name', n.addedName)
       } catch { /* harmless if it fails */ }
+    }
+  }
+
+  /* Bulk add from the regulars sheet. Sequential on purpose: the outbox
+     replays in order, so the list ends up in the order you ticked. */
+  async function addMany(picks) {
+    setShowRegulars(false)
+    for (const m of picks) {
+      await addItem(m.name, { categoryId: m.category_id, note: m.note, unit: m.unit })
     }
   }
 
@@ -1374,6 +1393,13 @@ function ListScreen({ listId, session }) {
           <div className="empty">
             <div className="big">Nothing on the list</div>
             Start typing at the bottom — Nosh files each item into its aisle automatically.
+            {master.length > 0 && (
+              <div style={{ marginTop: 14 }}>
+                <button className="btn" onClick={() => setShowRegulars(true)}>
+                  <Ico.star /> Add from your regulars
+                </button>
+              </div>
+            )}
           </div>
         )}
 
@@ -1450,6 +1476,10 @@ function ListScreen({ listId, session }) {
           const p = parseQuantityUnit(draft)
           addItem(p.name, { quantity: p.quantity, unit: p.unit })
         }}>
+          <button type="button" className="btn icon" onClick={() => setShowRegulars(true)}
+                  aria-label="Add from your regulars" title="Add from your regulars">
+            <Ico.star />
+          </button>
           <input ref={inputRef} className="input" placeholder="Add an item…  (try “2 lbs chicken”)" value={draft}
                  onChange={(e) => setDraft(e.target.value)}
                  onFocus={() => setFocused(true)}
@@ -1458,7 +1488,133 @@ function ListScreen({ listId, session }) {
           <button className="btn primary" disabled={!draft.trim()} aria-label="Add"><Ico.plus /></button>
         </form>
       </div>
+
+      {showRegulars && (
+        <RegularsSheet master={master} items={items}
+                       onAdd={addMany} onClose={() => setShowRegulars(false)} />
+      )}
     </>
+  )
+}
+
+/* ============================================================
+   Regulars — tick your usual shop back onto the list
+
+   master_items has counted every add since day one and nothing ever
+   showed you that. Rebuilding the weekly list should be ticking twelve
+   boxes, not typing twelve names.
+
+   Flat and frequency-ranked rather than grouped by aisle: the question
+   here is "what do we normally get?", not "where is it in the store",
+   and items get filed into their aisle automatically once added.
+   ============================================================ */
+
+/* One row per distinct item, keeping whichever spelling has been used most,
+   ordered by how often it's been added. Search is typo-tolerant for the same
+   reason the add bar is. */
+export function rankRegulars(master, q = '') {
+  const byKey = new Map()
+  for (const m of master || []) {
+    const k = itemKey(m.name)
+    if (!k) continue
+    const cur = byKey.get(k)
+    if (!cur || (m.use_count || 0) > (cur.use_count || 0)) byKey.set(k, m)
+  }
+  let out = [...byKey.values()]
+  if (String(q).trim()) out = out.filter((m) => matchesQuery(m.name, q) || isNearMatch(q, m.name))
+  return out.sort((a, b) =>
+    (b.use_count || 0) - (a.use_count || 0) || a.name.localeCompare(b.name))
+}
+
+// Keys of everything currently to-buy, so regulars already on the list can be
+// shown as done rather than offered again.
+export const activeItemKeys = (items) => {
+  const s = new Set()
+  for (const i of items || []) if (!i.crossed_off) s.add(itemKey(i.name))
+  return s
+}
+
+function RegularsSheet({ master, items, onAdd, onClose }) {
+  const [picked, setPicked] = useState(() => new Set())
+  const [q, setQ] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  const onList = useMemo(() => activeItemKeys(items), [items])
+  const rows = useMemo(() => rankRegulars(master, q), [master, q])
+
+  const toggle = (key) => setPicked((prev) => {
+    const next = new Set(prev)
+    next.has(key) ? next.delete(key) : next.add(key)
+    return next
+  })
+
+  async function submit() {
+    const chosen = rows.filter((m) => picked.has(itemKey(m.name)))
+    if (!chosen.length) return
+    setBusy(true)
+    await onAdd(chosen)
+  }
+
+  return (
+    <div className="sheet" role="dialog" aria-modal="true" aria-label="Your regulars">
+      <div className="sheet-head">
+        <button className="btn icon" onClick={onClose} aria-label="Close"><Ico.back /></button>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <h1>Your regulars</h1>
+          <div className="sub">Most-added first · tap to pick</div>
+        </div>
+      </div>
+
+      <div className="sheet-body">
+        <input className="input" placeholder="Search your regulars…" value={q}
+               onChange={(e) => setQ(e.target.value)} autoComplete="off" />
+
+        {rows.length === 0 ? (
+          <div className="empty">
+            {master.length === 0
+              ? <>Nothing remembered yet. Add a few items and they'll show up here.</>
+              : <>Nothing matches “{q}”.</>}
+          </div>
+        ) : (
+          <div className="rows" style={{ marginTop: 12 }}>
+            {rows.map((m) => {
+              const key = itemKey(m.name)
+              const already = onList.has(key)
+              const on = picked.has(key)
+              return (
+                <div className={'row' + (already ? ' done' : '')} key={m.id || key}>
+                  <button className={'check' + (on || already ? ' on' : '')}
+                          disabled={already}
+                          onClick={() => toggle(key)}
+                          aria-pressed={on}
+                          aria-label={already ? `${m.name} is already on the list` : `Add ${m.name}`}>
+                    {(on || already) && <Ico.check />}
+                  </button>
+                  <div className="body" onClick={() => !already && toggle(key)}>
+                    <div className="nm">
+                      {m.name}
+                      {m.unit ? <span className="muted small"> · {m.unit}</span> : null}
+                    </div>
+                    {already && <div className="nt">Already on the list</div>}
+                  </div>
+                  {(m.use_count || 0) > 1 && !already && (
+                    <span className="muted small" title={`Added ${m.use_count} times`}>{m.use_count}×</span>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        )}
+      </div>
+
+      <div className="sheet-foot">
+        <button className="btn primary block" disabled={busy || picked.size === 0} onClick={submit}>
+          {busy ? 'Adding…'
+            : picked.size === 0 ? 'Pick a few items'
+            : `Add ${picked.size} item${picked.size === 1 ? '' : 's'}`}
+        </button>
+      </div>
+    </div>
   )
 }
 
