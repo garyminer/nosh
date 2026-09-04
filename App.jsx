@@ -501,7 +501,7 @@ function ListScreen({ listId, session }) {
           // Someone new may have joined and added something — refresh names if we
           // see an author we don't have a name for yet.
           const known = new Set(knownPeopleRef.current)
-          if (data.some((i) => i.created_by && !known.has(i.created_by))) {
+          if (data.some((i) => i.added_by && !known.has(i.added_by))) {
             const { data: p } = await supabase.rpc('list_people', { p_list_id: listId })
             if (p) setPeople(p)
           }
@@ -580,6 +580,7 @@ function ListScreen({ listId, session }) {
       id: `tmp-${Date.now()}`, list_id: listId, name: titleCase(clean), quantity: 1,
       note: note || remembered?.note || null, category_id: catId, crossed_off: false,
       created_by: session.user.id, created_at: new Date().toISOString(),
+      added_by: session.user.id, added_at: new Date().toISOString(),
     }
     setItems((prev) => [...prev, optimistic])
 
@@ -601,9 +602,16 @@ function ListScreen({ listId, session }) {
 
   async function toggle(item) {
     const next = !item.crossed_off
-    setItems((prev) => prev.map((p) => (p.id === item.id ? { ...p, crossed_off: next, crossed_at: next ? new Date().toISOString() : null } : p)))
+    const now = new Date().toISOString()
+    // Un-crossing puts the item back on the to-buy list, so you become its
+    // adder. A DB trigger does the real work; this just keeps the UI honest
+    // until the write lands.
+    const reAdd = !next ? { added_by: session.user.id, added_at: now } : {}
+    setItems((prev) => prev.map((p) => (
+      p.id === item.id ? { ...p, crossed_off: next, crossed_at: next ? now : null, ...reAdd } : p
+    )))
     const { error } = await supabase.from('items')
-      .update({ crossed_off: next, crossed_at: next ? new Date().toISOString() : null })
+      .update({ crossed_off: next, crossed_at: next ? now : null })
       .eq('id', item.id)
     if (error) { setErr(error.message); load() }
   }
@@ -660,7 +668,7 @@ function ListScreen({ listId, session }) {
             <div className="rows">
               {g.items.map((it) => (
                 <ItemRow key={it.id} item={it} onToggle={() => toggle(it)}
-                         who={showWho ? whoLabel(it.created_by) : null}
+                         who={showWho ? whoLabel(it.added_by) : null}
                          onQty={(n) => setQuantity(it, n)} onOpen={() => navigate(`/i/${it.id}`)} />
               ))}
             </div>
@@ -677,7 +685,7 @@ function ListScreen({ listId, session }) {
             <div className="rows">
               {done.map((it) => (
                 <ItemRow key={it.id} item={it} done onToggle={() => toggle(it)}
-                         who={showWho ? whoLabel(it.created_by) : null}
+                         who={showWho ? whoLabel(it.added_by) : null}
                          onQty={(n) => setQuantity(it, n)} onOpen={() => navigate(`/i/${it.id}`)} />
               ))}
             </div>
@@ -723,7 +731,7 @@ function ItemRow({ item, done, who, onToggle, onQty, onOpen }) {
         <div className="nm">{item.name}</div>
         {item.note && <div className="nt">{item.note}</div>}
       </div>
-      {who && <Avatar id={item.created_by} label={who} />}
+      {who && <Avatar id={item.added_by} label={who} />}
       {!done && (
         <div className="qty">
           <button onClick={() => onQty(item.quantity - 1)} disabled={item.quantity <= 1} aria-label="Fewer">−</button>
@@ -795,9 +803,9 @@ function ItemScreen({ itemId, session }) {
   if (loading) return <div className="empty">Loading…</div>
   if (!item) return <div className="empty">Item not found.</div>
 
-  const adder = people.find((p) => p.user_id === item.created_by)
-  const adderName = item.created_by
-    ? personLabel(adder) + (item.created_by === session?.user?.id ? ' (you)' : '')
+  const adder = people.find((p) => p.user_id === item.added_by)
+  const adderName = item.added_by
+    ? personLabel(adder) + (item.added_by === session?.user?.id ? ' (you)' : '')
     : null
 
   return (
@@ -815,10 +823,10 @@ function ItemScreen({ itemId, session }) {
 
         {adderName && (
           <div className="byline">
-            <Avatar id={item.created_by} label={adderName} size={28} />
+            <Avatar id={item.added_by} label={adderName} size={28} />
             <span>
-              Added by <strong>{adderName}</strong>
-              {item.created_at ? ` · ${whenText(item.created_at)}` : ''}
+              Added to the list by <strong>{adderName}</strong>
+              {item.added_at ? ` · ${whenText(item.added_at)}` : ''}
             </span>
           </div>
         )}
