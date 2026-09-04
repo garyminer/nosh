@@ -156,6 +156,33 @@ textarea.input { min-height: 78px; resize: vertical; }
 .check.on { background: var(--accent); border-color: var(--accent); }
 .check svg { display: block; }
 
+/* who added this item */
+.who {
+  flex: none; display: grid; place-items: center;
+  border-radius: 50%; border: 1px solid transparent;
+  font-weight: 750; line-height: 1; letter-spacing: 0;
+  user-select: none;
+  background: hsl(var(--h, 220) 72% 93%);
+  color: hsl(var(--h, 220) 68% 32%);
+  border-color: hsl(var(--h, 220) 58% 80%);
+}
+@media (prefers-color-scheme: dark) {
+  .who {
+    background: hsl(var(--h, 220) 45% 24%);
+    color: hsl(var(--h, 220) 75% 82%);
+    border-color: hsl(var(--h, 220) 40% 38%);
+  }
+}
+.row.done .who { opacity: .55; }
+
+.byline {
+  display: flex; align-items: center; gap: 9px;
+  font-size: 13px; color: var(--muted);
+  background: var(--raised); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 10px 12px; margin-bottom: 14px;
+}
+.byline strong { color: var(--ink); font-weight: 650; }
+
 .qty { display: flex; align-items: center; gap: 6px; flex: none; }
 .qty button {
   width: 30px; height: 30px; border-radius: 8px; border: 1px solid var(--line);

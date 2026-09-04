@@ -118,6 +118,46 @@ function matchesQuery(name, q) {
 
 const titleCase = (s) => s.replace(/\b[a-z]/g, (c) => c.toUpperCase())
 
+/* ---------------- "who added this" helpers --------------- */
+
+// Turn a person row from list_people() into something displayable.
+function personLabel(p) {
+  if (!p) return 'Someone'
+  return p.display_name || (p.email || '').split('@')[0] || 'Someone'
+}
+
+function initialOf(label) {
+  const c = (label || '?').trim()[0]
+  return (c || '?').toUpperCase()
+}
+
+// Stable per-person colour so the same person is the same colour everywhere.
+function avatarHue(id) {
+  let h = 0
+  for (const ch of String(id || '')) h = (h * 31 + ch.charCodeAt(0)) % 360
+  return h
+}
+
+function Avatar({ id, label, size = 24 }) {
+  const hue = avatarHue(id)
+  return (
+    <span className="who" title={`Added by ${label}`} aria-label={`Added by ${label}`}
+          style={{ width: size, height: size, fontSize: Math.round(size * 0.46), '--h': String(hue) }}>
+      {initialOf(label)}
+    </span>
+  )
+}
+
+const whenText = (ts) => {
+  if (!ts) return ''
+  const d = new Date(ts)
+  const days = Math.max(0, Math.floor((Date.now() - d.getTime()) / 86400000))
+  if (days === 0) return 'today'
+  if (days === 1) return 'yesterday'
+  if (days < 7) return `${days} days ago`
+  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+}
+
 function useCopy() {
   const [copied, setCopied] = useState('')
   const copy = async (text, key = 'x') => {
@@ -160,7 +200,7 @@ export default function App() {
       {route.name === 'home' && <HomeScreen session={session} />}
       {route.name === 'list' && <ListScreen key={route.listId} listId={route.listId} session={session} />}
       {route.name === 'settings' && <ListSettings key={route.listId} listId={route.listId} session={session} />}
-      {route.name === 'item' && <ItemScreen key={route.itemId} itemId={route.itemId} />}
+      {route.name === 'item' && <ItemScreen key={route.itemId} itemId={route.itemId} session={session} />}
       {route.name === 'join' && <JoinScreen code={route.code} />}
       {route.name === 'import' && <ImportScreen />}
     </div>
@@ -423,22 +463,27 @@ function ListScreen({ listId, session }) {
   const [cats, setCats] = useState([])
   const [items, setItems] = useState([])
   const [master, setMaster] = useState([])
+  const [people, setPeople] = useState([])
   const [err, setErr] = useState('')
   const [loading, setLoading] = useState(true)
   const [draft, setDraft] = useState('')
   const [focused, setFocused] = useState(false)
   const inputRef = useRef(null)
+  const knownPeopleRef = useRef([])
+  useEffect(() => { knownPeopleRef.current = people.map((p) => p.user_id) }, [people])
 
   const load = useCallback(async () => {
-    const [l, c, i, m] = await Promise.all([
+    const [l, c, i, m, p] = await Promise.all([
       supabase.from('lists').select('*').eq('id', listId).maybeSingle(),
       supabase.from('categories').select('*').eq('list_id', listId).order('position'),
       supabase.from('items').select('*').eq('list_id', listId),
       supabase.from('master_items').select('*').eq('list_id', listId).order('use_count', { ascending: false }).limit(500),
+      supabase.rpc('list_people', { p_list_id: listId }),
     ])
-    const e = l.error || c.error || i.error || m.error
+    const e = l.error || c.error || i.error || m.error || p.error
     if (e) setErr(e.message)
     setList(l.data); setCats(c.data || []); setItems(i.data || []); setMaster(m.data || [])
+    setPeople(p.data || [])
     setLoading(false)
   }, [listId])
 
@@ -451,13 +496,33 @@ function ListScreen({ listId, session }) {
       .on('postgres_changes', { event: '*', schema: 'public', table: 'items', filter: `list_id=eq.${listId}` },
         async () => {
           const { data } = await supabase.from('items').select('*').eq('list_id', listId)
-          if (data) setItems(data)
+          if (!data) return
+          setItems(data)
+          // Someone new may have joined and added something — refresh names if we
+          // see an author we don't have a name for yet.
+          const known = new Set(knownPeopleRef.current)
+          if (data.some((i) => i.created_by && !known.has(i.created_by))) {
+            const { data: p } = await supabase.rpc('list_people', { p_list_id: listId })
+            if (p) setPeople(p)
+          }
         })
       .subscribe()
     return () => { supabase.removeChannel(ch) }
   }, [listId])
 
   const catById = useMemo(() => Object.fromEntries(cats.map((c) => [c.id, c])), [cats])
+
+  // user_id -> display label. Only worth showing when more than one person is on the list.
+  const nameById = useMemo(
+    () => Object.fromEntries(people.map((p) => [p.user_id, personLabel(p)])),
+    [people],
+  )
+  const showWho = people.length > 1
+  const whoLabel = (userId) => {
+    if (!userId) return null
+    const nm = nameById[userId] || 'Someone else'
+    return userId === session.user.id ? `${nm} (you)` : nm
+  }
 
   const active = items.filter((i) => !i.crossed_off)
   const done = items.filter((i) => i.crossed_off)
@@ -514,6 +579,7 @@ function ListScreen({ listId, session }) {
     const optimistic = {
       id: `tmp-${Date.now()}`, list_id: listId, name: titleCase(clean), quantity: 1,
       note: note || remembered?.note || null, category_id: catId, crossed_off: false,
+      created_by: session.user.id, created_at: new Date().toISOString(),
     }
     setItems((prev) => [...prev, optimistic])
 
@@ -594,6 +660,7 @@ function ListScreen({ listId, session }) {
             <div className="rows">
               {g.items.map((it) => (
                 <ItemRow key={it.id} item={it} onToggle={() => toggle(it)}
+                         who={showWho ? whoLabel(it.created_by) : null}
                          onQty={(n) => setQuantity(it, n)} onOpen={() => navigate(`/i/${it.id}`)} />
               ))}
             </div>
@@ -610,6 +677,7 @@ function ListScreen({ listId, session }) {
             <div className="rows">
               {done.map((it) => (
                 <ItemRow key={it.id} item={it} done onToggle={() => toggle(it)}
+                         who={showWho ? whoLabel(it.created_by) : null}
                          onQty={(n) => setQuantity(it, n)} onOpen={() => navigate(`/i/${it.id}`)} />
               ))}
             </div>
@@ -645,7 +713,7 @@ function ListScreen({ listId, session }) {
   )
 }
 
-function ItemRow({ item, done, onToggle, onQty, onOpen }) {
+function ItemRow({ item, done, who, onToggle, onQty, onOpen }) {
   return (
     <div className={'row' + (done ? ' done' : '')}>
       <button className={'check' + (done ? ' on' : '')} onClick={onToggle} aria-label={done ? 'Un-cross' : 'Cross off'}>
@@ -655,6 +723,7 @@ function ItemRow({ item, done, onToggle, onQty, onOpen }) {
         <div className="nm">{item.name}</div>
         {item.note && <div className="nt">{item.note}</div>}
       </div>
+      {who && <Avatar id={item.created_by} label={who} />}
       {!done && (
         <div className="qty">
           <button onClick={() => onQty(item.quantity - 1)} disabled={item.quantity <= 1} aria-label="Fewer">−</button>
@@ -671,9 +740,10 @@ function ItemRow({ item, done, onToggle, onQty, onOpen }) {
    Item detail
    ============================================================ */
 
-function ItemScreen({ itemId }) {
+function ItemScreen({ itemId, session }) {
   const [item, setItem] = useState(null)
   const [cats, setCats] = useState([])
+  const [people, setPeople] = useState([])
   const [err, setErr] = useState('')
   const [saving, setSaving] = useState(false)
   const [loading, setLoading] = useState(true)
@@ -685,8 +755,12 @@ function ItemScreen({ itemId }) {
       if (error) setErr(error.message)
       setItem(data)
       if (data) {
-        const { data: c } = await supabase.from('categories').select('*').eq('list_id', data.list_id).order('position')
-        setCats(c || [])
+        const [c, p] = await Promise.all([
+          supabase.from('categories').select('*').eq('list_id', data.list_id).order('position'),
+          supabase.rpc('list_people', { p_list_id: data.list_id }),
+        ])
+        setCats(c.data || [])
+        setPeople(p.data || [])
       }
       setLoading(false)
     })()
@@ -721,6 +795,11 @@ function ItemScreen({ itemId }) {
   if (loading) return <div className="empty">Loading…</div>
   if (!item) return <div className="empty">Item not found.</div>
 
+  const adder = people.find((p) => p.user_id === item.created_by)
+  const adderName = item.created_by
+    ? personLabel(adder) + (item.created_by === session?.user?.id ? ' (you)' : '')
+    : null
+
   return (
     <>
       <div className="topbar">
@@ -733,6 +812,16 @@ function ItemScreen({ itemId }) {
 
       <div className="wrap">
         {err && <div className="err">{err}</div>}
+
+        {adderName && (
+          <div className="byline">
+            <Avatar id={item.created_by} label={adderName} size={28} />
+            <span>
+              Added by <strong>{adderName}</strong>
+              {item.created_at ? ` · ${whenText(item.created_at)}` : ''}
+            </span>
+          </div>
+        )}
 
         <label className="field"><span>Name</span>
           <input className="input" value={item.name} onChange={(e) => setItem({ ...item, name: e.target.value })} />
