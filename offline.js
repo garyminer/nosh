@@ -105,6 +105,31 @@ export function cancelQueuedAdd(tempId) {
   return true
 }
 
+/* What the queue still intends to do, folded down per item.
+
+   A server payload that arrives while these are outstanding is out of date by
+   definition — it can't know about changes that haven't been sent. Merging
+   these back over it is what stops a crossed-off item springing back onto the
+   list. */
+export function pendingItemPatches() {
+  const out = new Map()
+  for (const op of getOutbox()) {
+    if (op.k === 'update') {
+      out.set(op.id, { ...(out.get(op.id) || {}), ...op.patch })
+    } else if (op.k === 'delete') {
+      for (const id of op.ids) out.set(id, { __deleted: true })
+    }
+  }
+  return out
+}
+
+// Rows that exist only on this device so far, so a refresh doesn't drop them.
+export function queuedAddIds() {
+  const s = new Set()
+  for (const op of getOutbox()) if (op.k === 'add' && op.tempId) s.add(op.tempId)
+  return s
+}
+
 /* ---------------- temporary id -> real id --------------- */
 
 export const isTempId = (id) => typeof id === 'string' && id.startsWith('tmp-')

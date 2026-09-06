@@ -3,6 +3,7 @@ import { supabase } from './supabaseClient.js'
 import {
   cacheGet, cacheSet, sendOrQueue, startOutboxSync, cancelQueuedAdd,
   pendingCount, onOutboxChange, isTempId, findCachedItem,
+  pendingItemPatches, queuedAddIds,
 } from './offline.js'
 
 /* ============================================================
@@ -148,7 +149,6 @@ const UNITS = [
   { u: 'L',      alias: ['l', 'liter', 'liters', 'litre', 'litres'] },
   { u: 'mL',     alias: ['ml', 'milliliter', 'milliliters'] },
   { u: 'dozen',  alias: ['dozen', 'dozens', 'doz'] },
-  { u: 'case',   alias: ['case', 'cases'] },
   { u: 'bunch',  alias: ['bunch', 'bunches'] },
   { u: 'head',   alias: ['head', 'heads'] },
   { u: 'clove',  alias: ['clove', 'cloves'] },
@@ -379,6 +379,37 @@ const whenText = (ts) => {
   if (days === 1) return 'yesterday'
   if (days < 7) return `${days} days ago`
   return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+}
+
+/* ---------------- reconciling server data with local changes ----------
+
+   Every write fires a realtime event, whose handler re-reads the whole list.
+   Cross five things off quickly and five re-reads race four in-flight writes;
+   any read that comes back before its write commits used to overwrite the
+   screen with older truth, and the item just crossed off jumped back onto the
+   to-buy list. The next event then corrected it, which is why it looked
+   intermittent and haunted rather than plainly broken.
+
+   The rule: a server payload cannot know about changes it hasn't been told
+   about yet, so anything still outstanding locally wins over it.
+   ---------------------------------------------------------------------- */
+
+export function mergeServerItems(serverRows, localRows, pending, localOnlyIds) {
+  const rows = []
+  for (const row of serverRows || []) {
+    const patch = pending.get(row.id)
+    if (patch && patch.__deleted) continue            // deleted here, not there yet
+    rows.push(patch ? { ...row, ...patch } : row)
+  }
+
+  // Keep rows that exist only on this device (a queued add, or an optimistic
+  // row whose insert is still in flight) — a refresh must not swallow them.
+  const seen = new Set(rows.map((r) => r.id))
+  for (const row of localRows || []) {
+    if (seen.has(row.id)) continue
+    if (localOnlyIds.has(row.id)) rows.push(row)
+  }
+  return rows
 }
 
 /* ---------------- photos --------------------------------------------
@@ -1047,6 +1078,43 @@ function ListScreen({ listId, session }) {
   const trackRef = useRef({ name: '', shopping: false })
   const shoppingTimer = useRef(null)
 
+  /* Writes that have been sent but not yet confirmed. The outbox covers
+     anything queued offline; this covers the online case, where a write is
+     in flight and a refresh can easily beat it back. Entries are dropped a
+     beat after confirmation, because a read issued *before* the write
+     committed can still be in the air. */
+  const inflightRef = useRef(new Map())
+  const refreshTimer = useRef(null)
+  const CONFIRM_GRACE_MS = 2000
+
+  const markInflight = useCallback((id, patch) => {
+    const cur = inflightRef.current.get(id) || {}
+    inflightRef.current.set(id, { ...cur, ...patch })
+  }, [])
+
+  const releaseInflight = useCallback((id) => {
+    setTimeout(() => inflightRef.current.delete(id), CONFIRM_GRACE_MS)
+  }, [])
+
+  // Local truth that the server may not know about yet: queued ops + in-flight ones.
+  const localState = useCallback(() => {
+    const pending = pendingItemPatches()
+    for (const [id, patch] of inflightRef.current) {
+      pending.set(id, { ...(pending.get(id) || {}), ...patch })
+    }
+    return { pending, localOnly: queuedAddIds() }
+  }, [])
+
+  const applyServerItems = useCallback((serverRows) => {
+    setItems((prev) => {
+      const { pending, localOnly } = localState()
+      // An optimistic row whose insert is still in flight has no queued op to
+      // point at, so treat every temp id still on screen as local-only.
+      for (const r of prev) if (isTempId(r.id)) localOnly.add(r.id)
+      return mergeServerItems(serverRows, prev, pending, localOnly)
+    })
+  }, [localState])
+
   useWakeLock(keepAwake)
   useEffect(() => { writeWakePref(keepAwake) }, [keepAwake])
   const knownPeopleRef = useRef([])
@@ -1082,7 +1150,8 @@ function ListScreen({ listId, session }) {
         setLoading(false)
         return
       }
-      setList(l.data); setCats(c.data || []); setItems(i.data || []); setMaster(m.data || [])
+      setList(l.data); setCats(c.data || []); setMaster(m.data || [])
+      applyServerItems(i.data || [])
       setPeople(p.data || [])
       // Tolerated separately: if migration 04 hasn't run yet, the rest of the
       // list should still load rather than the screen going blank.
@@ -1112,17 +1181,24 @@ function ListScreen({ listId, session }) {
     const ch = supabase
       .channel(`list-${listId}`, { config: { presence: { key: me } } })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'items', filter: `list_id=eq.${listId}` },
-        async () => {
-          const { data } = await supabase.from('items').select('*').eq('list_id', listId)
-          if (!data) return
-          setItems(data)
-          // Someone new may have joined and added something — refresh names if we
-          // see an author we don't have a name for yet.
-          const known = new Set(knownPeopleRef.current)
-          if (data.some((i) => i.added_by && !known.has(i.added_by))) {
-            const { data: p } = await supabase.rpc('list_people', { p_list_id: listId })
-            if (p) setPeople(p)
-          }
+        () => {
+          /* Coalesce the burst. Crossing off a row of items fires an event per
+             write; without this each one triggers its own full re-read, and
+             those reads race the writes still in flight. One refresh shortly
+             after the burst settles is both cheaper and far less racy. */
+          clearTimeout(refreshTimer.current)
+          refreshTimer.current = setTimeout(async () => {
+            const { data } = await supabase.from('items').select('*').eq('list_id', listId)
+            if (!data) return
+            applyServerItems(data)
+            // Someone new may have joined and added something — refresh names if
+            // we see an author we don't have a name for yet.
+            const known = new Set(knownPeopleRef.current)
+            if (data.some((i) => i.added_by && !known.has(i.added_by))) {
+              const { data: p } = await supabase.rpc('list_people', { p_list_id: listId })
+              if (p) setPeople(p)
+            }
+          }, 300)
         })
       // 'sync' already fires for joins and leaves, so it's the only one needed.
       .on('presence', { event: 'sync' }, () => setPresent(readPresence(ch, me)))
@@ -1136,10 +1212,11 @@ function ListScreen({ listId, session }) {
     return () => {
       subscribedRef.current = false
       chanRef.current = null
+      clearTimeout(refreshTimer.current)
       setPresent([])
       supabase.removeChannel(ch)
     }
-  }, [listId, session.user.id])
+  }, [listId, session.user.id, applyServerItems])
 
   // Keep the offline copy current after every change. master_items is trimmed
   // because it's the only unbounded piece and localStorage is not.
@@ -1473,12 +1550,18 @@ function ListScreen({ listId, session }) {
     setItems((prev) => prev.map((p) => (
       p.id === item.id ? { ...p, crossed_off: next, crossed_at: next ? now : null, ...reAdd } : p
     )))
-    const patch = { crossed_off: next, crossed_at: next ? now : null }
+    const patch = { crossed_off: next, crossed_at: next ? now : null, ...reAdd }
+    markInflight(item.id, patch)
     const res = await sendOrQueue(
-      { k: 'update', id: item.id, patch },
-      () => supabase.from('items').update(patch).eq('id', item.id),
+      { k: 'update', id: item.id, patch: { crossed_off: next, crossed_at: next ? now : null } },
+      () => supabase.from('items').update({ crossed_off: next, crossed_at: next ? now : null }).eq('id', item.id),
     )
-    if (res.error) { setErr(res.error.message); load() }
+    if (res.error) {
+      inflightRef.current.delete(item.id)
+      setErr(res.error.message); load()
+      return
+    }
+    releaseInflight(item.id)
   }
 
   async function setQuantity(item, q, unit) {
@@ -1486,11 +1569,17 @@ function ListScreen({ listId, session }) {
     const patch = { quantity: n }
     if (unit !== undefined && unit !== item.unit) patch.unit = unit || null
     setItems((prev) => prev.map((p) => (p.id === item.id ? { ...p, ...patch } : p)))
+    markInflight(item.id, patch)
     const res = await sendOrQueue(
       { k: 'update', id: item.id, patch },
       () => supabase.from('items').update(patch).eq('id', item.id),
     )
-    if (res.error) { setErr(res.error.message); load() }
+    if (res.error) {
+      inflightRef.current.delete(item.id)
+      setErr(res.error.message); load()
+      return
+    }
+    releaseInflight(item.id)
   }
 
   async function clearCrossed() {
@@ -1504,11 +1593,17 @@ function ListScreen({ listId, session }) {
     const realIds = ids.filter((id) => !(isTempId(id) && cancelQueuedAdd(id)))
     if (!realIds.length) return
 
+    for (const id of realIds) markInflight(id, { __deleted: true })
     const res = await sendOrQueue(
       { k: 'delete', ids: realIds },
       () => supabase.from('items').delete().in('id', realIds),
     )
-    if (res.error) { setErr(res.error.message); load() }
+    if (res.error) {
+      for (const id of realIds) inflightRef.current.delete(id)
+      setErr(res.error.message); load()
+      return
+    }
+    for (const id of realIds) releaseInflight(id)
   }
 
   if (loading) return <div className="empty">Loading…</div>
