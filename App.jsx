@@ -32,6 +32,7 @@ function parseRoute(h) {
   if ((m = p.match(/^\/l\/([^/]+)$/))) return { name: 'list', listId: m[1] }
   if ((m = p.match(/^\/i\/([^/]+)$/))) return { name: 'item', itemId: m[1] }
   if (p === '/import') return { name: 'import' }
+  if (p === '/voice') return { name: 'voice' }
   return { name: 'home' }
 }
 
@@ -713,6 +714,7 @@ export default function App() {
       {route.name === 'item' && <ItemScreen key={route.itemId} itemId={route.itemId} session={session} />}
       {route.name === 'join' && <JoinScreen code={route.code} />}
       {route.name === 'import' && <ImportScreen />}
+      {route.name === 'voice' && <VoiceScreen session={session} />}
     </div>
   )
 }
@@ -997,6 +999,10 @@ function HomeScreen({ session }) {
 
             <button className="btn block" style={{ marginTop: 8 }} onClick={() => navigate('/import')}>
               Import lists &amp; items
+            </button>
+
+            <button className="btn block" style={{ marginTop: 8 }} onClick={() => navigate('/voice')}>
+              Add by voice (Siri)
             </button>
 
             <form className="card" style={{ marginTop: 18 }} onSubmit={join}>
@@ -2599,6 +2605,240 @@ function JoinScreen({ code }) {
     </div>
   )
   return <div className="empty">Joining the list…</div>
+}
+
+/* ============================================================
+   Siri voice setup
+
+   The Shortcut posts dictated text to one database function, voice_add,
+   which is the only thing the anon key is allowed to call. The token below
+   stands in for a login — see nosh-migration-06-voice.sql.
+   ============================================================ */
+
+const VOICE_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || ''
+const VOICE_URL =
+  `${import.meta.env.VITE_SUPABASE_URL || ''}/rest/v1/rpc/voice_add?apikey=${VOICE_KEY}`
+
+function VoiceScreen({ session }) {
+  const [token, setToken] = useState('')
+  const [lists, setLists] = useState([])
+  const [defaultId, setDefaultId] = useState('')
+  const [loading, setLoading] = useState(true)
+  const [err, setErr] = useState('')
+  const [phrase, setPhrase] = useState('')
+  const [tryResult, setTryResult] = useState('')
+  const [trying, setTrying] = useState(false)
+  const [copied, copy] = useCopy()
+
+  useEffect(() => {
+    let alive = true
+    ;(async () => {
+      try {
+        const [tok, ls, prof] = await Promise.all([
+          supabase.rpc('voice_token_get'),
+          supabase.from('lists').select('id,name').order('name'),
+          supabase.from('profiles').select('voice_default_list_id').eq('id', session.user.id).maybeSingle(),
+        ])
+        if (!alive) return
+        const e = tok.error || ls.error
+        if (e) setErr(e.message)
+        setToken(tok.data || '')
+        setLists(ls.data || [])
+        setDefaultId(prof.data?.voice_default_list_id || '')
+        setPhrase(`two gallons of milk to ${(ls.data || [])[0]?.name || 'my list'}`)
+      } catch (e) {
+        if (alive && !isOfflineError(e)) setErr(e.message || String(e))
+      } finally {
+        if (alive) setLoading(false)
+      }
+    })()
+    return () => { alive = false }
+  }, [session.user.id])
+
+  async function saveDefault(id) {
+    setDefaultId(id)
+    const { error } = await supabase.from('profiles')
+      .update({ voice_default_list_id: id || null }).eq('id', session.user.id)
+    if (error) setErr(error.message)
+  }
+
+  async function resetToken() {
+    if (!window.confirm('Make a new code? Any Shortcut still using the old one will stop working until you paste the new code into it.')) return
+    setErr(''); setTryResult('')
+    const { data, error } = await supabase.rpc('voice_token_reset')
+    if (error) return setErr(error.message)
+    setToken(data)
+  }
+
+  /* Dry run: says exactly what the same words would do, without adding
+     anything. The list-name match is the part that goes wrong, and this is
+     the only way to see it fail safely. */
+  async function runTest(e) {
+    e.preventDefault()
+    if (!phrase.trim() || !token) return
+    setTrying(true); setTryResult('')
+    const { data, error } = await supabase.rpc('voice_add',
+      { p_token: token, p_text: phrase, p_dry: true })
+    setTrying(false)
+    setTryResult(error ? `Error: ${error.message}` : data)
+  }
+
+  return (
+    <>
+      <div className="topbar">
+        <button className="btn icon" onClick={() => navigate('/')} aria-label="Back"><Ico.back /></button>
+        <h1>Add by voice</h1>
+      </div>
+
+      <div className="wrap">
+        {err && <div className="err">{err}</div>}
+
+        <div className="card">
+          <h3>“Hey Siri, add to Nosh”</h3>
+          <p className="meta" style={{ marginBottom: 10 }}>
+            One Shortcut on your iPhone, set up once. Siri asks what to add, you
+            say it, and it lands on the list — on everyone’s phone, straight away.
+            Works from the Watch, CarPlay and HomePod too.
+          </p>
+          <p className="meta" style={{ margin: 0 }}>
+            Say the list out loud to choose it: <em>“milk to Costco”</em>. Say
+            several things at once: <em>“bananas, bread and a dozen eggs”</em>.
+            Quantities and sizes come through: <em>“two gallons of milk”</em>,
+            <em> “three pounds of ground beef”</em>.
+          </p>
+        </div>
+
+        {loading ? <div className="empty">Loading…</div> : (
+          <>
+            <div className="card">
+              <h3>Default list</h3>
+              <p className="meta" style={{ marginBottom: 10 }}>
+                Where things go when you don’t say a list name.
+              </p>
+              <label className="field" style={{ marginBottom: 0 }}>
+                <select className="input" value={defaultId} onChange={(e) => saveDefault(e.target.value)}>
+                  <option value="">— ask me each time —</option>
+                  {lists.map((l) => <option key={l.id} value={l.id}>{l.name}</option>)}
+                </select>
+              </label>
+            </div>
+
+            <div className="card">
+              <h3>Your two settings</h3>
+              <p className="meta" style={{ marginBottom: 12 }}>
+                Paste these into the Shortcut. The code is yours alone — items
+                you add by voice show up under your name.
+              </p>
+
+              <div className="field">
+                <span>Request URL</span>
+                <input className="input" readOnly value={VOICE_URL}
+                       onFocus={(e) => e.target.select()}
+                       style={{ fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 12 }} />
+              </div>
+              <button className="btn block" style={{ marginBottom: 14 }} onClick={() => copy(VOICE_URL, 'url')}>
+                {copied === 'url' ? 'URL copied' : 'Copy URL'}
+              </button>
+
+              <div className="field">
+                <span>Your voice code</span>
+                <input className="input" readOnly value={token}
+                       onFocus={(e) => e.target.select()}
+                       style={{ fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 12 }} />
+              </div>
+              <button className="btn primary block" onClick={() => copy(token, 'tok')}>
+                {copied === 'tok' ? 'Code copied' : 'Copy code'}
+              </button>
+            </div>
+
+            <div className="card">
+              <h3>Build the Shortcut</h3>
+              <p className="meta" style={{ marginBottom: 10 }}>
+                On your iPhone, in the <strong>Shortcuts</strong> app. Two actions, about three minutes.
+              </p>
+              <details>
+                <summary className="small" style={{ cursor: 'pointer', padding: '4px 0' }}>Show the steps</summary>
+                <ol className="small" style={{ paddingLeft: 20, lineHeight: 1.7, marginTop: 10 }}>
+                  <li>Shortcuts → <strong>+</strong> → <strong>Add Action</strong>.</li>
+                  <li>Search <strong>Ask for Input</strong>, add it. Set <em>Prompt</em> to
+                      “What should I add?” and leave the type as Text.</li>
+                  <li><strong>Add Action</strong> again → search <strong>Get Contents of URL</strong>, add it.</li>
+                  <li>Paste the <strong>Request URL</strong> above into its URL box.</li>
+                  <li>Tap <strong>Show More</strong>. Set <em>Method</em> to <strong>POST</strong>.</li>
+                  <li>Under <em>Headers</em>, tap Add: key <strong>Accept</strong>, value <strong>text/plain</strong>.</li>
+                  <li>Set <em>Request Body</em> to <strong>JSON</strong>, then add two text fields:
+                      <br />• key <strong>p_token</strong> → your voice code
+                      <br />• key <strong>p_text</strong> → tap the field, then pick
+                      <strong> Provided Input</strong> from the variable bar above the keyboard.</li>
+                  <li>Rename the shortcut <strong>Add to Nosh</strong> (tap its name at the top).</li>
+                  <li>Done. Say <em>“Hey Siri, add to Nosh.”</em></li>
+                </ol>
+                <p className="meta" style={{ marginTop: 10, marginBottom: 6 }}>
+                  <strong>If the reply has quotation marks around it</strong> — the
+                  Accept header didn’t save. Check step 6.
+                </p>
+                <p className="meta" style={{ marginTop: 0, marginBottom: 6 }}>
+                  <strong>If it says “No API key found in request”</strong> — your
+                  project wants the key as a header instead of in the URL. Add a
+                  second header, <strong>apikey</strong>, with this value:
+                </p>
+                <button className="btn small block" onClick={() => copy(VOICE_KEY, 'key')}>
+                  {copied === 'key' ? 'API key copied' : 'Copy API key'}
+                </button>
+                <p className="meta" style={{ marginTop: 8, marginBottom: 0 }}>
+                  <strong>If Siri says the shortcut failed</strong> and nothing has
+                  used Nosh for a week — the free database goes to sleep. Open the
+                  app once to wake it, then try again.
+                </p>
+              </details>
+            </div>
+
+            <div className="card">
+              <h3>Try the wording</h3>
+              <p className="meta" style={{ marginBottom: 10 }}>
+                Type what you’d say. Nothing is added — this just shows how it
+                would be read, which is where list names usually trip up.
+              </p>
+              <form onSubmit={runTest} style={{ display: 'flex', gap: 8 }}>
+                <input className="input" value={phrase} onChange={(e) => setPhrase(e.target.value)}
+                       placeholder="milk to Costco" />
+                <button className="btn" disabled={trying || !phrase.trim()}>Test</button>
+              </form>
+              {tryResult && (
+                <p className="small" style={{ marginTop: 10, marginBottom: 0 }}>{tryResult}</p>
+              )}
+            </div>
+
+            <div className="card">
+              <h3>Names Siri can use</h3>
+              <p className="meta" style={{ marginBottom: 10 }}>
+                Say any of these after “to”. Spaces, apostrophes and case don’t
+                matter, and a near miss still lands.
+              </p>
+              <div className="stack">
+                {lists.map((l) => (
+                  <div className="row-between small" key={l.id}>
+                    <span>“…to {l.name}”</span>
+                    {l.id === defaultId && <span className="muted">default</span>}
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="card">
+              <h3>If you lose your phone</h3>
+              <p className="meta" style={{ marginBottom: 10 }}>
+                Your code is a password for adding items — nothing more. Anyone
+                holding it can put things on your lists, but can’t read, delete
+                or share them. Make a new one and the old one stops working.
+              </p>
+              <button className="btn danger block" onClick={resetToken}>Make a new code</button>
+            </div>
+          </>
+        )}
+      </div>
+    </>
+  )
 }
 
 /* ============================================================
