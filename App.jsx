@@ -347,11 +347,16 @@ function initialOf(label) {
    · 190 teal · 215 blue · 275 purple · 330 pink. */
 const HUE_OVERRIDES = new Map([
   ['annette', 215],   // blue — the id hash had put her in the purples
+  ['anais',   330],   // bright pink, by request
 ])
 
 // Stable per-person colour so the same person is the same colour everywhere.
 function avatarHue(id, label) {
-  const key = String(label || '').toLowerCase().replace(/\(you\)\s*$/, '').trim()
+  // Accents are stripped before matching, so an override keyed 'anais' still
+  // finds someone who typed their name as "Anaïs".
+  const key = String(label || '')
+    .normalize('NFD').replace(/\p{Diacritic}/gu, '')
+    .toLowerCase().replace(/\(you\)\s*$/, '').trim()
   if (HUE_OVERRIDES.has(key)) return HUE_OVERRIDES.get(key)
   const first = key.split(/\s+/)[0]
   if (HUE_OVERRIDES.has(first)) return HUE_OVERRIDES.get(first)
@@ -2694,7 +2699,7 @@ function VoiceScreen({ session }) {
         {err && <div className="err">{err}</div>}
 
         <div className="card">
-          <h3>“Hey Siri, add to Nosh”</h3>
+          <h3>“Hey Siri, Grocery Run”</h3>
           <p className="meta" style={{ marginBottom: 10 }}>
             One Shortcut on your iPhone, set up once. Siri asks what to add, you
             say it, and it lands on the list — on everyone’s phone, straight away.
@@ -2760,27 +2765,63 @@ function VoiceScreen({ session }) {
                 <summary className="small" style={{ cursor: 'pointer', padding: '4px 0' }}>Show the steps</summary>
                 <ol className="small" style={{ paddingLeft: 20, lineHeight: 1.7, marginTop: 10 }}>
                   <li>Shortcuts → <strong>+</strong> → <strong>Add Action</strong>.</li>
-                  <li>Search <strong>Ask for Input</strong>, add it. Set <em>Prompt</em> to
-                      “What should I add?” and leave the type as Text.</li>
+                  <li>Search <strong>Ask for Input</strong>, add it. Leave the type as Text
+                      and set <em>Prompt</em> to “What should I add?”. (Emptying that box makes
+                      Siri chime and listen instead of asking aloud, which is quicker — but if
+                      Siri then runs the shortcut and nothing happens, put the text back.)</li>
                   <li><strong>Add Action</strong> again → search <strong>Get Contents of URL</strong>, add it.</li>
                   <li>Paste the <strong>Request URL</strong> above into its URL box.</li>
-                  <li>Tap <strong>Show More</strong>. Set <em>Method</em> to <strong>POST</strong>.</li>
-                  <li>Under <em>Headers</em>, tap Add: key <strong>Accept</strong>, value <strong>text/plain</strong>.</li>
+                  <li>Tap <strong>Show More</strong>. Set <em>Method</em> to <strong>POST</strong>.
+                      Leave <em>Headers</em> empty — the key is already in the URL.</li>
                   <li>Set <em>Request Body</em> to <strong>JSON</strong>, then add two text fields:
-                      <br />• key <strong>p_token</strong> → your voice code
-                      <br />• key <strong>p_text</strong> → tap the field, then pick
-                      <strong> Provided Input</strong> from the variable bar above the keyboard.</li>
-                  <li>Rename the shortcut <strong>Add to Nosh</strong> (tap its name at the top).</li>
-                  <li>Done. Say <em>“Hey Siri, add to Nosh.”</em></li>
+                      <br />• key <strong>p_token</strong> → paste your voice code
+                      <br />• key <strong>p_text</strong> → tap its <em>value</em> box, then tap
+                      <strong> Ask for Input</strong> in the bar above the keyboard (the inserted
+                      pill may read “Provided Input” — same thing). It has to end up as a blue
+                      pill; typed words won’t work, and <em>Ask Each Time</em> is a different
+                      thing that will prompt you twice.</li>
+                  <li>Rename it (tap its name at the top). <strong>The name is the phrase
+                      you say to Siri</strong>, so it has to be words Siri transcribes reliably —
+                      “Nosh” is not one of them, and neither is anything starting with
+                      <em>add, open, set, play, call, text, remind</em> or <em>find</em>, which
+                      Siri reserves for itself. <strong>Grocery Run</strong> works well;
+                      <em>Market List</em> and <em>Food Run</em> are good alternatives.</li>
+                  <li>Done. Say <em>“Hey Siri, Grocery Run.”</em> Lock and unlock the phone first
+                      if a fresh rename isn’t recognised yet.</li>
                 </ol>
                 <p className="meta" style={{ marginTop: 10, marginBottom: 6 }}>
-                  <strong>If the reply has quotation marks around it</strong> — the
-                  Accept header didn’t save. Check step 6.
+                  <strong>Siri doesn’t react to the phrase at all</strong> — look at what it
+                  printed on screen. If your shortcut’s name came back misheard, rename the
+                  shortcut to plainer words (or to whatever Siri actually typed). You can also
+                  duplicate the shortcut under two or three names so any of them work.
+                </p>
+                <p className="meta" style={{ marginTop: 0, marginBottom: 6 }}>
+                  <strong>“The shortcut sent an empty item”</strong> — the
+                  <strong> p_text</strong> value box is blank. It needs the blue
+                  <strong> Ask for Input</strong> pill, not typed words: tap the
+                  box, then tap <strong>Ask for Input</strong> in the bar above the
+                  keyboard, or long-press the box and choose <em>Insert Variable</em>.
+                </p>
+                <p className="meta" style={{ marginTop: 0, marginBottom: 6 }}>
+                  <strong>An item called “provided input” appears on your list</strong>
+                  {' '}— you typed the words instead of inserting the variable. Clear
+                  the box and insert it properly.
+                </p>
+                <p className="meta" style={{ marginTop: 0, marginBottom: 6 }}>
+                  <strong>“PGRST107 — none of these media types are available”</strong>
+                  {' '}— there’s an <strong>Accept</strong> header on the Get Contents
+                  of URL action. Delete it. Headers should be empty.
+                </p>
+                <p className="meta" style={{ marginTop: 0, marginBottom: 6 }}>
+                  <strong>If the reply has quotation marks around it</strong> — add a
+                  <strong> Replace Text</strong> action after Get Contents of URL:
+                  find <code>"</code>, replace with nothing, input Contents of URL.
+                  Then point your notification at the Replace Text output.
                 </p>
                 <p className="meta" style={{ marginTop: 0, marginBottom: 6 }}>
                   <strong>If it says “No API key found in request”</strong> — your
                   project wants the key as a header instead of in the URL. Add a
-                  second header, <strong>apikey</strong>, with this value:
+                  header called <strong>apikey</strong> with this value:
                 </p>
                 <button className="btn small block" onClick={() => copy(VOICE_KEY, 'key')}>
                   {copied === 'key' ? 'API key copied' : 'Copy API key'}
