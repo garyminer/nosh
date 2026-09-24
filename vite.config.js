@@ -18,8 +18,16 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT_STATIC = [
   'sw.js',
   'manifest.webmanifest',
+  'nosh-icon-180.png',
   'nosh-icon-192.png',
   'nosh-icon-512.png',
+]
+
+/* iOS probes /apple-touch-icon.png at the site root whenever it can't use the
+   <link> tag, and falls back to a screenshot of the page if that 404s — a
+   black tile for anyone on the dark theme. Ship the 180 under both names. */
+const ROOT_ALIASES = [
+  ['nosh-icon-180.png', 'apple-touch-icon.png'],
 ]
 
 function copyRootStatic() {
@@ -55,6 +63,15 @@ function copyRootStatic() {
         } else {
           copyFileSync(from, resolve(dest, file))
         }
+      }
+
+      for (const [file, alias] of ROOT_ALIASES) {
+        const from = resolve(HERE, file)
+        if (!existsSync(from)) {
+          this.warn(`nosh: skipping missing static file "${file}" (alias "${alias}")`)
+          continue
+        }
+        copyFileSync(from, resolve(dest, alias))
       }
     },
   }
